@@ -1,0 +1,78 @@
+Ultra Stalker 10.1.0-beta57-rc4-secfix22-ui10
+
+Static release QA
+- Package structure: validated Debian/IPK ar archive layout.
+- Python syntax: all packaged .py files compiled with CPython 3.13.5.
+- Packaged bytecode: none.
+- Permissions: no setuid/setgid or world-writable packaged files.
+- Native payloads: none; Architecture: all remains appropriate.
+- Declared runtime dependencies: python3-core, python3-sqlite3, python3-pillow.
+- Production metadata: normalized.
+
+Receiver-only QA still required before declaring a final stable release:
+- Enigma2 startup/import smoke test on supported Python 3.13 and 3.14 images.
+- Portal login/browse/playback, M3U/Xtream, picons/artwork/TMDB, subtitles, recording, backup/restore, support bundle, shutdown/restart.
+
+
+UI10 static QA:
+- Diagnostic instrumentation is gated by diagnostic_logging.
+- UI health snapshots are written by the runtime-log worker, not the GUI thread.
+- Home/Browser/Grid/Details close hooks were re-audited.
+- Artwork/TMDB/provider call sites in primary UI paths remain worker/async scoped.
+- Existing poster, title-cleaning, identity, player hard-stop and subtitle behavior retained.
+
+Automated regression suite (secfix22):
+- A package-aware runner discovers every tests/test_*.py module and preserves
+  package-relative imports consistently.
+- Run all automated tests with:
+  python3 /usr/lib/enigma2/python/Plugins/Extensions/UltraStalker/run_tests.py
+- The runner returns exit status 0 on success and non-zero on any test failure,
+  so it can be used directly in release/CI checks.
+- Current automated suite: 80 tests, all passing in this release candidate.
+- Coverage includes URL parser ambiguity, HTTP credential policy, cross-origin
+  sensitive-header stripping, HTTPS downgrade blocking, portal DNS pinning,
+  SSRF/private-origin scoping, loopback/link-local blocking, proxy token
+  enforcement and legacy migration, corrupt JSON quarantine, backup integrity
+  and rollback fault injection, subtitle archive hardening, log redaction,
+  Player lifecycle cleanup, Player module boundaries, and endurance sampling.
+
+
+Receiver endurance instrumentation (secfix22):
+- Privacy-safe process monitor tracks RSS, VmSize, open FDs and threads.
+- Baseline/current/peak/delta counters are included in Diagnostics/support bundles.
+- Guard flags suspicious growth above +96 MiB RSS, +32 FDs or +8 threads.
+- 6 automated tests validate stable, RSS-growth, FD/thread-growth, high-water, periodic sampling and rate limiting.
+- These counters support receiver stress QA but do not replace real OpenATV/OpenBH playback/zapping tests.
+- Runtime-log worker now records a privacy-safe soak_resource_sample every 60 seconds while active, including current RSS/FD/thread counts, baseline deltas, RSS peak and guard warnings.
+- Long receiver QA can therefore be reviewed from /tmp/ultrastalker/runtime.log or the persistent runtime log when diagnostic logging persistence is enabled.
+
+SECURITY RELEASE GATE (secfix20+)
+---------------------------------
+Before packaging RC/final builds, run:
+  python3 /usr/lib/enigma2/python/Plugins/Extensions/UltraStalker/run_release_gates.py
+
+This is a mandatory focused gate for:
+- tampered downloads.json / path-containment regressions
+- symlink/path escape regressions
+- runtime download-path mutation
+- compatibility-call regressions that retry after an internal TypeError
+
+The full test suite must still pass via run_tests.py.
+
+
+FINAL RELEASE GATE (secfix22+)
+------------------------------
+Before promoting an RC build to Stable, run:
+  python3 /usr/lib/enigma2/python/Plugins/Extensions/UltraStalker/run_final_release_gate.py
+
+The final gate verifies:
+- source compile/syntax integrity
+- no packaged .pyc/.pyo/__pycache__ artifacts after validation
+- no setuid/setgid or world-writable plugin files
+- runtime version metadata coherence
+- focused download-path and TypeError compatibility security gates
+- the complete automated regression suite
+
+A PASS here is necessary but does not replace the real receiver soak gate.
+After hardware soak, run run_receiver_soak_check.py and require PASS before
+changing the build classification from Production Candidate to Stable.

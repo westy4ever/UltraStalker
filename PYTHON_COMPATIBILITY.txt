@@ -1,0 +1,4 @@
+Ultra Stalker 10.1.0-beta57-rc4-secfix14-ui10
+Official Python support: CPython 3.13.x and 3.14.x (GIL-enabled Enigma2 builds).
+Target images: OpenBH 5.6 (Python 3.13) and OpenBH 6.0 (Python 3.14).
+Free-threaded/no-GIL Python builds are intentionally rejected.

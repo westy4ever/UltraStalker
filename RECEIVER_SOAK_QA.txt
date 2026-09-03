@@ -1,0 +1,48 @@
+Ultra Stalker Receiver Soak / Stress QA
+=======================================
+
+Purpose
+- Validate long-running receiver stability after the automated regression suite.
+- Watch Enigma2 process RSS, open file descriptors and threads for sustained growth.
+- Runtime samples are privacy-safe and contain resource counters only.
+
+Instrumentation
+- While the Ultra Stalker runtime-log worker is active, a soak_resource_sample is recorded every 60 seconds.
+- Default volatile log: /tmp/ultrastalker/runtime.log
+- Each sample includes current RSS/FD/thread counts, baseline deltas, RSS peak and warning state.
+- Guard thresholds from the process baseline: RSS +96 MiB, FDs +32, threads +8.
+
+Recommended receiver run
+1. Start Enigma2 cleanly and open Ultra Stalker.
+2. Exercise the plugin for 2-4 hours.
+3. Perform at least 100 player open/close cycles and 200 live zaps.
+4. Alternate Live, VOD and Series playback.
+5. Run subtitle search/download several times.
+6. Close screens while artwork/subtitle work is active.
+7. Disconnect/reconnect networking during playback and browsing.
+8. Exercise bouquet/EPG export and one backup/restore cycle.
+9. Re-open the plugin after restore and continue playback/zapping.
+10. Before declaring success, leave the plugin idle for several minutes so temporary resources can settle.
+
+Review
+- Inspect soak_resource_sample rows in /tmp/ultrastalker/runtime.log.
+- No sustained monotonic growth should remain after idle/settle periods.
+- A temporary RSS peak is acceptable if current RSS returns near the baseline.
+- FDs and thread counts should return near baseline after closing Player/screens.
+- Any guard warning should be investigated with the nearby runtime breadcrumbs.
+- Export the support bundle from Diagnostics at the end of the run; it includes baseline/current/peak/delta endurance counters.
+
+Pass criteria
+- No Enigma2 crash/restart or frozen UI.
+- No persistent decoder/audio playback after Player close.
+- No sustained RSS growth above the +96 MiB guard.
+- No persistent FD growth above +32.
+- No persistent thread growth above +8.
+- Player remains reusable after repeated start/stop/zap/network-failure cycles.
+
+Automated final check
+- After the final idle/settle period run:
+  python3 /usr/lib/enigma2/python/Plugins/Extensions/UltraStalker/run_receiver_soak_check.py
+- PASS requires at least 5 resource samples and the final 3 samples to remain within all guards.
+- Transient peaks are reported but do not fail the run if resources return below the limits during the final settle window.
+- Exit status: 0 PASS, 1 FAIL, 2 insufficient/missing samples.
