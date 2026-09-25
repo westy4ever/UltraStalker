@@ -461,7 +461,7 @@ class _RecordingManager(object):
             self.timer = eTimer()
             try: self.conn = self.timer.timeout.connect(self.tick)
             except Exception: self.timer.callback.append(self.tick)
-            self.timer.start(1000, False)
+            self.timer.start(15000, False)
         except Exception as exc:
             LOG.warning("Recording manager timer unavailable: %s", exc)
             self.timer = None
@@ -540,6 +540,9 @@ class _RecordingManager(object):
             if changed:
                 with _LOCK: _save_jobs(kept)
             self._start_worker(due)
+            if self.timer is not None:
+                active=bool(due or (self._worker is not None and self._worker.is_alive()) or not self._results.empty())
+                self.timer.start(1000 if active else 15000, False)
         except Exception as exc:
             LOG.exception("Recording manager tick failed: %s", exc)
 

@@ -23,18 +23,30 @@ from ..log import get_logger
 
 LOG = get_logger()
 
-BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
+BACKUP_DIR = "/media/hdd/UltraStalker/Backup"
+LEGACY_BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
 BACKUP_PREFIX = "ultrastalker-backup-"
 OPTIONAL_FILES = {
     "profiles.json": CONFIG_FILE,
     "disabled_profiles.json": DISABLED_FILE,
     "settings.json": SETTINGS_FILE,
     "recent_searches.json": os.path.join(CONFIG_DIR, "recent_searches.json"),
-    "home_hero.json": os.path.join(CONFIG_DIR, "home_hero.json"),
     "smart_engines.json": os.path.join(CONFIG_DIR, "smart_engines.json"),
     "title_engines.json": os.path.join(CONFIG_DIR, "title_engines.json"),
     "ui_state.json": os.path.join(CONFIG_DIR, "ui_state.json"),
+    ".wizard_done": os.path.join(CONFIG_DIR, ".wizard_done"),
+    "portals.txt": os.path.join(CONFIG_DIR, "portals.txt"),
+    "portal.txt": os.path.join(CONFIG_DIR, "portal.txt"),
+    # Keep legacy catalog members recognized so old backups remain readable.
+    # These two files are bundled release data, not user state: new backups do
+    # not capture them and restore never replaces/deletes the package catalogs.
+    "server_catalog_portal.txt": os.path.join(CONFIG_DIR, ".uslib", ".catalog_a"),
+    "server_catalog_xtream.txt": os.path.join(CONFIG_DIR, ".uslib", ".catalog_b"),
 }
+BUNDLED_CATALOG_MEMBERS = frozenset((
+    "server_catalog_portal.txt",
+    "server_catalog_xtream.txt",
+))
 SECRET_FILES = {"api_keys.conf": API_KEYS_FILE}
 DATABASE_MEMBER = "ultrastalker.db"
 MANIFEST_MEMBER = "manifest.json"
@@ -43,6 +55,8 @@ MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_MEMBER_BYTES = 96 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 192 * 1024 * 1024
 _SAFE_SECRET_WORDS = ("credential", "api_key", "apikey", "secret", "token", "password", "passwd")
+_BACKUP_IO_LOCK = threading.RLock()
+
 _SAFE_EXACT_SECRET_KEYS = {
     "parental_pin", "tmdb_credential", "tmdb_api_key", "tmdb_read_token", "tmdb_api_token",
     "imdb_api_key", "imdb_access_key_id", "imdb_secret_access_key", "imdb_session_token",
@@ -97,7 +111,7 @@ def _safe_name(path):
 def list_backups():
     _ensure_dirs()
     rows = []
-    for root in (BACKUP_DIR, "/tmp"):
+    for root in (BACKUP_DIR, LEGACY_BACKUP_DIR, "/tmp"):
         try: names = os.listdir(root)
         except OSError: continue
         for name in names:
@@ -200,66 +214,97 @@ def _sha256_archive_member(archive, member):
             digest.update(chunk)
     return digest.hexdigest()
 
-def create_backup(include_secrets=False, destination=None, authenticate=False):
-    _ensure_dirs()
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.abspath(destination or os.path.join(BACKUP_DIR, BACKUP_PREFIX + stamp + ".zip"))
-    temp_dir = tempfile.mkdtemp(prefix="spobh-backup-")
-    archive_temp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
-    db_copy = os.path.join(temp_dir, DATABASE_MEMBER)
-    included = []
-    try:
-        _database_snapshot(db_copy)
-        manifest = {
-            "product": "UltraStalker", "format": 7,
-            "plugin_version": PLUGIN_VERSION, "created_at": int(time.time()),
-            "contains_secrets": bool(include_secrets),
-        }
-        hashes = {}
-        with zipfile.ZipFile(archive_temp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-            archive.write(db_copy, DATABASE_MEMBER); included.append(DATABASE_MEMBER); hashes[DATABASE_MEMBER] = _sha256_file(db_copy)
-            # Keep state-file reads coherent with profile/settings writers. The SQLite
-            # snapshot above is independent and intentionally taken outside this lock.
-            with STATE_IO_LOCK:
-                for member, source in OPTIONAL_FILES.items():
-                    if not os.path.isfile(source):
-                        continue
-                    if member == "settings.json" and not include_secrets:
-                        payload = _safe_settings_payload(source)
-                        archive.writestr(member, payload)
-                        hashes[member] = _sha256_bytes(payload)
-                    else:
-                        archive.write(source, member)
-                        hashes[member] = _sha256_file(source)
-                    included.append(member)
-                if include_secrets:
-                    for member, source in SECRET_FILES.items():
-                        if os.path.isfile(source):
-                            archive.write(source, member); included.append(member); hashes[member] = _sha256_file(source)
-            manifest["members"] = sorted(included)
-            manifest["sha256"] = {member: hashes[member] for member in sorted(hashes)}
-            manifest["integrity_scope"] = "corruption-detection"
-            manifest["authenticated"] = bool(authenticate)
-            if authenticate:
-                key = _backup_auth_key(create=True)
-                manifest["authentication"] = {
-                    "scheme": "hmac-sha256",
-                    "scope": "local-device",
-                    "digest": _manifest_hmac(manifest, key),
-                }
-            archive.writestr(MANIFEST_MEMBER, json.dumps(manifest, ensure_ascii=False, indent=2))
-        if os.path.getsize(archive_temp) > MAX_ARCHIVE_BYTES:
-            raise ValueError("Backup exceeds the maximum archive size")
-        os.replace(archive_temp, path)
-        _fsync_parent_dir(path)
-        os.chmod(path, 0o600)
-        return {"path": path, "members": sorted(included), "contains_secrets": bool(include_secrets)}
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        try:
-            if os.path.exists(archive_temp): os.unlink(archive_temp)
-        except OSError: pass
 
+def _unique_backup_path(path):
+    """Return a non-existing destination so backups never overwrite each other."""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    suffix = 1
+    while True:
+        candidate = "%s-%02d%s" % (root, suffix, ext)
+        if not os.path.exists(candidate):
+            return candidate
+        suffix += 1
+
+
+def create_backup(include_secrets=True, destination=None, authenticate=False):
+    """Create one complete, portable user-state backup on HDD.
+
+    Backups intentionally include every user-entered credential/API value.
+    Artwork/poster/backdrop caches are excluded because they already live
+    persistently on HDD and can be many gigabytes.
+
+    ``include_secrets`` and ``authenticate`` remain accepted for old callers,
+    but Ultra Stalker always creates a complete portable backup.
+    """
+    with _BACKUP_IO_LOCK:
+        _ensure_dirs()
+        if destination is None:
+            # Never silently fall back to flash for the new full backup. A receiver
+            # without /media/hdd should fail clearly rather than fill /etc or /tmp.
+            if not os.path.isdir('/media/hdd'):
+                raise ValueError("HDD is not available at /media/hdd")
+            destination = os.path.join(BACKUP_DIR, BACKUP_PREFIX + time.strftime("%Y%m%d-%H%M%S") + ".zip")
+        path = _unique_backup_path(destination)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="spobh-backup-")
+        archive_temp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
+        db_copy = os.path.join(temp_dir, DATABASE_MEMBER)
+        included = []
+        try:
+            # Capture DB + JSON/text state under the same writer barrier.  The ZIP
+            # compression itself happens afterwards, outside the locks, so normal
+            # playback/UI writers are paused only for the short snapshot copy.
+            staged_members = {}
+            with STATE_IO_LOCK:
+                with DB.write_guard():
+                    _database_snapshot(db_copy)
+                    staged_members[DATABASE_MEMBER] = db_copy
+                    for member, source in list(OPTIONAL_FILES.items()) + list(SECRET_FILES.items()):
+                        if member in BUNDLED_CATALOG_MEMBERS:
+                            continue
+                        if not os.path.isfile(source):
+                            continue
+                        staged = os.path.join(temp_dir, member)
+                        shutil.copy2(source, staged)
+                        staged_members[member] = staged
+
+            manifest = {
+                "product": "UltraStalker", "format": 8,
+                "plugin_version": PLUGIN_VERSION, "created_at": int(time.time()),
+                "contains_secrets": True,
+                "backup_kind": "complete-user-state",
+                "artwork_included": False,
+                "portable": True,
+            }
+            hashes = {}
+            with zipfile.ZipFile(archive_temp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+                for member in sorted(staged_members):
+                    source = staged_members[member]
+                    archive.write(source, member)
+                    included.append(member)
+                    hashes[member] = _sha256_file(source)
+                manifest["members"] = sorted(included)
+                manifest["sha256"] = {member: hashes[member] for member in sorted(hashes)}
+                manifest["integrity_scope"] = "corruption-detection"
+                manifest["authenticated"] = False
+                archive.writestr(MANIFEST_MEMBER, json.dumps(manifest, ensure_ascii=False, indent=2))
+            if os.path.getsize(archive_temp) > MAX_ARCHIVE_BYTES:
+                raise ValueError("Backup exceeds the maximum archive size")
+            # Verify the fully-written temporary archive before publishing it.
+            inspect_backup(archive_temp)
+            os.chmod(archive_temp, 0o600)
+            os.replace(archive_temp, path)
+            _fsync_parent_dir(path)
+            os.chmod(path, 0o600)
+            return {"path": path, "members": sorted(included), "contains_secrets": True}
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            try:
+                if os.path.exists(archive_temp): os.unlink(archive_temp)
+            except OSError: pass
 
 def _validate_json_member(path, member):
     if member == "api_keys.conf" or not member.endswith(".json"):
@@ -290,7 +335,12 @@ def inspect_backup(path):
         manifest = json.loads(archive.read(MANIFEST_MEMBER).decode("utf-8", "strict"))
         if manifest.get("product") != "UltraStalker": raise ValueError("This is not a UltraStalker backup")
         backup_format = int(manifest.get("format") or 0)
-        if backup_format not in (1, 2, 3, 4, 5, 6, 7): raise ValueError("Unsupported backup format")
+        if backup_format not in (1, 2, 3, 4, 5, 6, 7, 8): raise ValueError("Unsupported backup format")
+        if backup_format >= 8:
+            if manifest.get("backup_kind") != "complete-user-state" or not bool(manifest.get("contains_secrets")):
+                raise ValueError("Backup is not marked as complete user state")
+            if DATABASE_MEMBER not in names:
+                raise ValueError("Complete backup database is missing")
         declared = manifest.get("members")
         if isinstance(declared, list):
             actual = sorted(name for name in names if name != MANIFEST_MEMBER)
@@ -408,10 +458,12 @@ def restore_backup(path, restore_secrets=False, cancel_event=None):
     check_cancel()
     _ensure_dirs()
     manifest = inspect_backup(path)
+    if int(manifest.get("format") or 0) >= 8:
+        restore_secrets = True
     check_cancel()
     temp_dir = tempfile.mkdtemp(prefix="spobh-restore-")
     rollback_dir = tempfile.mkdtemp(prefix="spobh-rollback-", dir=CONFIG_DIR)
-    restored, committed, prepared, existed = [], [], [], {}
+    restored, removed, committed, prepared, existed = [], [], [], [], {}
     recording_session = None
     runtime_quiesced = False
     try:
@@ -428,17 +480,26 @@ def restore_backup(path, restore_secrets=False, cancel_event=None):
         check_cancel()
         db_source = _validate_staged(temp_dir)
         check_cancel()
-        targets = dict(OPTIONAL_FILES)
+        targets = {member: target for member, target in OPTIONAL_FILES.items()
+                   if member not in BUNDLED_CATALOG_MEMBERS}
         if restore_secrets: targets.update(SECRET_FILES)
         if os.path.isfile(db_source): targets[DATABASE_MEMBER] = DB_PATH
+        exact_restore = int(manifest.get("format") or 0) >= 8
 
         for member, target in targets.items():
             check_cancel()
             source = os.path.join(temp_dir, member)
-            if not os.path.isfile(source): continue
+            source_exists = os.path.isfile(source)
+            # Format 8 is a complete state snapshot: absence is meaningful.  If a
+            # file did not exist when the backup was taken, remove any newer local
+            # copy during restore instead of silently mixing old and restored state.
+            if not source_exists and not exact_restore:
+                continue
             os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-            incoming = target + ".restore"
-            shutil.copy2(source, incoming); os.chmod(incoming, 0o600)
+            incoming = None
+            if source_exists:
+                incoming = target + ".restore"
+                shutil.copy2(source, incoming); os.chmod(incoming, 0o600)
             prepared.append((member, target, incoming))
 
         check_cancel()
@@ -468,8 +529,14 @@ def restore_backup(path, restore_secrets=False, cancel_event=None):
                             except OSError:
                                 pass
                     for member, target, incoming in prepared:
-                        os.replace(incoming, target)
-                        _fsync_parent_dir(target)
+                        if incoming is None:
+                            if os.path.exists(target):
+                                os.unlink(target)
+                                _fsync_parent_dir(target)
+                                removed.append(member)
+                        else:
+                            os.replace(incoming, target)
+                            _fsync_parent_dir(target)
                         committed.append((member, target)); restored.append(member)
                 except Exception as commit_exc:
                     commit_failed = True
@@ -532,11 +599,12 @@ def restore_backup(path, restore_secrets=False, cancel_event=None):
         except Exception as exc:
             reconciliation["bouquets_error"] = str(exc)[:240]
             LOG.warning("Restore bouquet reconciliation failed: %s", exc)
-        return {"path": path, "restored": sorted(restored), "manifest": manifest, "reconciliation": reconciliation}
+        return {"path": path, "restored": sorted(restored), "removed": sorted(removed), "manifest": manifest, "reconciliation": reconciliation}
     finally:
         if runtime_quiesced:
             _resume_background_runtime(recording_session)
         for _member, _target, incoming in prepared:
+            if not incoming:continue
             try:
                 if os.path.exists(incoming): os.unlink(incoming)
             except OSError: pass

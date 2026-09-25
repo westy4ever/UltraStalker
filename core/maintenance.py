@@ -41,7 +41,7 @@ def cache_stats():
     total_files = 0
     total_bytes = 0
     if not persistent_cache.hdd_read_ready(force=True):
-        empty={name:{"files":0,"bytes":0,"oldest":0,"newest":0} for name in ("posters","backdrops","generated","tmdb","portal_art","quality","index")}
+        empty={name:{"files":0,"bytes":0,"oldest":0,"newest":0} for name in ("posters","backdrops","generated","index","home","live","quality","logs")}
         return {
             "root": persistent_cache.ROOT, "persistent": True,
             "files": 0, "bytes": 0, "categories": empty, "disk": {},
@@ -50,10 +50,11 @@ def cache_stats():
         ("posters", persistent_cache.POSTERS),
         ("backdrops", persistent_cache.BACKDROPS),
         ("generated", persistent_cache.GENERATED),
-        ("tmdb", persistent_cache.TMDB_META),
-        ("portal_art", persistent_cache.PORTAL_ART),
-        ("quality", persistent_cache.QUALITY),
         ("index", persistent_cache.INDEX),
+        ("home", persistent_cache.HOME),
+        ("live", persistent_cache.LIVE),
+        ("quality", persistent_cache.QUALITY),
+        ("logs", persistent_cache.LOGS),
     ):
         files = 0
         size = 0
@@ -97,10 +98,17 @@ def prune_cache(max_bytes, expired_age_seconds=None):
     now = time.time()
     entries = []
     total = 0
-    for root in persistent_cache.ALL_DIRS[1:]:
+    # release: Stable-Focus and BLUE generated presentation assets are durable
+    # user-owned cache, just like posters/backdrops/index metadata.  A newer
+    # folder must never evict an older folder's decoder-ready Cinematic assets.
+    # Keep GENERATED out of automatic LRU.  Explicit Clear Cache calls
+    # prune_cache(0), where GENERATED is deliberately included.
+    if max_bytes == 0:
+        prune_roots=(persistent_cache.GENERATED,persistent_cache.HOME,persistent_cache.LIVE,persistent_cache.QUALITY,persistent_cache.LOGS)
+    else:
+        prune_roots=(persistent_cache.HOME,persistent_cache.LIVE,persistent_cache.QUALITY,persistent_cache.LOGS)
+    for root in prune_roots:
         for path, st in _iter_files(root) or ():
-            # Keep migration/manifest controls outside child dirs; everything
-            # here is reproducible data and therefore safe to evict.
             total += int(st.st_size)
             entries.append((float(st.st_mtime), float(st.st_mtime), int(st.st_size), path))
     before_files = len(entries)

@@ -17,6 +17,7 @@ from ..repositories.database import DB
 from ..compat import python_compatibility, runtime_capabilities
 from ..version import PLUGIN_VERSION, BUILD_NAME
 from ..log import redact as _log_redact, get_logger
+from ..persistent_cache import ROOT
 
 CONFIG_DIR = '/etc/enigma2/ultrastalker'
 LOG_FILE = '/tmp/ultrastalker/plugin.log'
@@ -180,6 +181,26 @@ def export_support_bundle(path='/tmp/ultrastalker-support.zip', profile=None):
                     archive.writestr('ARCHITECTURE.md', handle.read())
             except Exception as exc:
                 LOG.debug("Support bundle could not include architecture file: %s", exc)
+            # R123 bridge: include ONLY the user's frozen application-chrome
+            # assets so the exact approved R63 master can be bundled 1:1 in the
+            # next public build. These files contain no portal URL/MAC/API key.
+            try:
+                fixed_dir = os.path.join(ROOT, 'fixed_ui_adaptive_r63')
+                allowed = {
+                    'manifest.json', 'home_ambient.png', 'home_menu.png',
+                    'home_recent.png', 'home_menu_focus.png',
+                    'home_recent_focus.png', 'utility_row.png',
+                    'utility_row_selected.png',
+                }
+                if os.path.isdir(fixed_dir):
+                    for name in sorted(os.listdir(fixed_dir)):
+                        low = name.lower()
+                        if name in allowed or low.startswith('adaptive_source.'):
+                            src = os.path.join(fixed_dir, name)
+                            if os.path.isfile(src) and os.path.getsize(src) > 0:
+                                archive.write(src, 'fixed-master/' + name)
+            except Exception as exc:
+                LOG.debug("Support bundle could not include fixed master: %s", exc)
         os.replace(temp, path); temp = None
         os.chmod(path, 0o600)
         return path

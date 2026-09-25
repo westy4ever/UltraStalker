@@ -4,6 +4,30 @@ import re
 import unicodedata
 
 
+def strip_arabic_tashkeel(value):
+    """Remove optional Arabic tashkeel for display only.
+
+    Preserve decomposed maddah/hamza marks because they are part of the letter
+    identity, matching the Details description policy. Stored/provider text and
+    language selection are never changed.
+    """
+    text=str(value or "")
+    if not text:
+        return text
+    preserve={0x0653,0x0654,0x0655,0x065F}
+    out=[]
+    for ch in text:
+        cp=ord(ch)
+        if cp in preserve:
+            out.append(ch)
+            continue
+        in_arabic_block=(0x0600<=cp<=0x06FF) or (0x0750<=cp<=0x077F) or (0x08A0<=cp<=0x08FF)
+        if in_arabic_block and unicodedata.category(ch) in ("Mn","Me"):
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def clean_display_text(value, max_chars=140):
     raw = unicodedata.normalize("NFKC", str(value or ""))
     chars = []
@@ -23,8 +47,11 @@ def clean_display_text(value, max_chars=140):
     return clean
 
 
-def clean_live_channel_name(value):
-    text=str(value or "").strip()
+def clean_live_channel_name(value, enabled=True):
+    raw=str(value or "").strip()
+    if not enabled:
+        return raw or "Channel"
+    text=raw
     try:text=unicodedata.normalize("NFKC",text)
     except Exception:pass
     text=re.sub(r"^\s*#+\s*","",text); text=re.sub(r"\s*#+\s*$","",text)

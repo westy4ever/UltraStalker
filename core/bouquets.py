@@ -13,15 +13,18 @@ import ipaddress
 import json
 import os
 import secrets
+import shutil
 import socket
 import threading
 import tempfile
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
 
 from ..client import StalkerClient
+from ..title_clean import clean_title, catalogue_title
 from ..storage import CONFIG_DIR, load_settings, load_json_file, _fsync_parent_dir
 from ..log import get_logger
 from .recording import event_times
@@ -52,6 +55,7 @@ _XMLTV_ORPHAN_MAX_THREADS = 12
 _PROXY_REQUEST_SLOTS = threading.BoundedSemaphore(8)
 _PROXY_SOCKET_TIMEOUT = 12.0
 LOG = get_logger()
+_PICON_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ultrastalker-export-picon")
 
 
 def _profile_key(profile):
@@ -167,8 +171,16 @@ def _choose_export_port(registry):
 def _client(profile):
     cfg = load_settings()
     profile = profile if isinstance(profile, dict) else {}
+    portal = str(profile.get("portal") or "")
+    source_type = str(profile.get("source_type") or "").strip().lower()
+    low = portal.lower()
+    if not source_type:
+        source_type = "m3u" if (".m3u" in low or "type=m3u" in low or "output=m3u" in low or ("get.php" in low and ("username=" in low or "password=" in low))) else "stalker"
+    if source_type == "m3u":
+        from ..m3u_adapter import M3UClient
+        return M3UClient(portal, profile.get("mac") or "M3U", timeout=cfg.get("timeout", 10))
     return StalkerClient(
-        profile.get("portal"), profile.get("mac"), timeout=cfg.get("timeout", 10),
+        portal, profile.get("mac"), timeout=cfg.get("timeout", 10),
         allow_http_fallback=profile.get("allow_http_fallback", False),
         tls_mode=profile.get("tls_mode", "auto"),
         device_profile=profile.get("device_profile", "auto"),
@@ -300,13 +312,89 @@ def _migrate_legacy_proxy_tokens(registry=None):
             raise
 
 
-def _service_ref(url, service_type=4097):
+def _service_ref(url, service_type=4097, identity=None):
     encoded = urllib.parse.quote(str(url or ""), safe="")
+    if identity not in (None, ""):
+        digest = hashlib.sha1(str(identity).encode("utf-8", "ignore")).hexdigest().upper()
+        sid, tsid, onid = digest[:4], digest[4:8], digest[8:12]
+        return "%d:0:1:%s:%s:%s:0:0:0:0:%s" % (int(service_type or 4097), sid, tsid, onid, encoded)
     return "%d:0:1:0:0:0:0:0:0:0:%s" % (int(service_type or 4097), encoded)
 
 
 def _safe_name(value):
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())[:180]
+
+
+def _receiver_name(row, media_type="itv"):
+    # When the browser supplies _receiver_name it is the exact final display
+    # title already shown inside Ultra Stalker. Do not run a second, different
+    # cleanup pass during receiver export.
+    explicit = (row or {}).get("_receiver_name")
+    if explicit not in (None, ""):
+        return _safe_name(explicit)
+    raw = (row or {}).get("name") or (row or {}).get("title") or "Item"
+    if str(media_type or "itv").lower() in ("vod", "movie", "series"):
+        return _safe_name(catalogue_title(raw))
+    if str(media_type or "itv").lower() == "episode":
+        return _safe_name(raw)
+    return _safe_name(clean_title(raw))
+
+
+def _picon_root():
+    for root in ("/media/hdd/picon", "/media/usb/picon", "/usr/share/enigma2/picon"):
+        parent = os.path.dirname(root)
+        if os.path.isdir(parent) and os.access(parent, os.W_OK):
+            try:
+                os.makedirs(root, exist_ok=True)
+                return root
+            except OSError:
+                pass
+    return None
+
+
+def _picon_filename(service_ref):
+    parts = str(service_ref or "").split(":")[:10]
+    if len(parts) < 10:
+        return ""
+    return "_".join(parts) + ".png"
+
+
+def _publish_picon(service_ref, source_path):
+    source = str(source_path or "")
+    if not source or not os.path.isfile(source):
+        return ""
+    root = _picon_root()
+    name = _picon_filename(service_ref)
+    if not root or not name:
+        return ""
+    target = os.path.join(root, name)
+    try:
+        if source.lower().endswith(".png"):
+            shutil.copyfile(source, target)
+        else:
+            try:
+                from PIL import Image
+                with Image.open(source) as image:
+                    image.convert("RGBA").save(target, "PNG", optimize=True)
+            except Exception:
+                return ""
+        return target if os.path.isfile(target) else ""
+    except Exception as exc:
+        LOG.debug("Receiver picon publish failed: %s", exc)
+        return ""
+
+
+def _queue_picon_publish(service_ref, source_path):
+    """Publish cached artwork after bouquet commit so VOD/Series export never waits on image conversion."""
+    source = str(source_path or "")
+    if not source or not os.path.isfile(source):
+        return False
+    try:
+        _PICON_EXPORT_EXECUTOR.submit(_publish_picon, service_ref, source)
+        return True
+    except Exception as exc:
+        LOG.debug("Receiver picon queue failed: %s", exc)
+        return False
 
 
 def _atomic_text(path, text, mode=0o644):
@@ -400,13 +488,15 @@ def export_live_integration(profile, channels, service_type=4097):
             proxy_token = _new_proxy_token()
 
             registry_channels = {}
-            bouquet_lines = ["#NAME Ultra Stalker - %s" % _safe_name(profile.get("name") or profile.get("portal") or "Portal")]
+            bouquet_lines = ["#NAME Live TV"]
             channel_xml = ['<?xml version="1.0" encoding="utf-8"?>', "<channels>"]
             for row in rows:
                 ckey = _channel_key(row); registry_channels[ckey] = row
-                name = _safe_name(row.get("name") or row.get("title") or "Channel")
-                ref = _service_ref(_proxy_url(pkey, ckey, port, proxy_token), service_type)
+                row["_receiver_media_type"] = "itv"
+                name = _receiver_name(row, "itv")
+                ref = _service_ref(_proxy_url(pkey, ckey, port, proxy_token), service_type, identity=ckey)
                 bouquet_lines.append("#SERVICE %s:%s" % (ref, name)); bouquet_lines.append("#DESCRIPTION %s" % name)
+                _publish_picon(ref, row.get("_receiver_picon_local"))
                 channel_xml.append('  <channel id="%s">%s</channel>' % (escape(_xmltv_id(pkey, ckey), {'"': '&quot;'}), escape(ref)))
             channel_xml.append("</channels>")
 
@@ -456,6 +546,382 @@ def export_live_integration(profile, channels, service_type=4097):
         raise
 
 
+
+def export_live_category_bouquet(profile, channels, category_name, category_id=None, service_type=4097):
+    """Export one Live category as its own Enigma2 TV bouquet.
+
+    This intentionally does not reload the plugin/browser screen.  The dynamic
+    proxy registry is merged in-place so exported channels keep working outside
+    Ultra Stalker while the caller can preserve its exact category selection.
+    Re-exporting the same category overwrites the same bouquet file atomically.
+    """
+    profile = dict(profile or {})
+    rows = [dict(row) for row in (channels or []) if isinstance(row, dict) and (row.get("cmd") or row.get("command") or row.get("url"))]
+    if not rows:
+        raise ValueError("Category returned no exportable live channels")
+
+    pkey = _profile_key(profile)
+    label = _safe_name(category_name or "Live")
+    identity = str(category_id or category_name or "live")
+    digest = hashlib.sha1(identity.encode("utf-8", "ignore")).hexdigest()[:10]
+    bouquet_name = "userbouquet.ultrastalker_%s_cat_%s.tv" % (pkey, digest)
+    bouquet_path = os.path.join(ENIGMA2_DIR, bouquet_name)
+    bouquet_index = os.path.join(ENIGMA2_DIR, "bouquets.tv")
+    shared_paths = _bouquet_paths(pkey)
+    touched = [bouquet_path, bouquet_index, shared_paths["epg_channels"], shared_paths["epg_source"], REGISTRY_FILE]
+    snapshots = {path: _snapshot_file(path) for path in touched}
+    old_registry = _read_registry()
+    old_entries = _registry_entries(old_registry)
+    proxy_started_for_export = False
+
+    try:
+        with _REGISTRY_LOCK:
+            registry = _read_registry()
+            port = _choose_export_port(registry)
+            was_running = _SERVER is not None
+            start_proxy_server(port=port, require_registry=False, strict=True)
+            proxy_started_for_export = not was_running and _SERVER is not None
+
+            entry = dict(registry.get(pkey) or {})
+            existing_channels = dict(entry.get("channels") or {})
+            token = str(entry.get("proxy_token") or "") or _new_proxy_token()
+            bouquet_lines = ["#NAME %s" % label]
+            exported_keys = []
+            for row in rows:
+                ckey = _channel_key(row)
+                existing_channels[ckey] = row
+                exported_keys.append(ckey)
+                row["_receiver_media_type"] = "itv"
+                name = _receiver_name(row, "itv")
+                ref = _service_ref(_proxy_url(pkey, ckey, port, token), service_type, identity=ckey)
+                bouquet_lines.append("#SERVICE %s:%s" % (ref, name))
+                bouquet_lines.append("#DESCRIPTION %s" % name)
+                _publish_picon(ref, row.get("_receiver_picon_local"))
+
+            try:
+                with open(bouquet_index, "r", encoding="utf-8", errors="replace") as handle:
+                    existing = handle.read().splitlines()
+            except OSError:
+                existing = ["#NAME Bouquets (TV)"]
+            include = '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "%s" ORDER BY bouquet' % bouquet_name
+            if not any(bouquet_name in line for line in existing):
+                existing.append(include)
+
+            _atomic_text(bouquet_path, "\n".join(bouquet_lines) + "\n", 0o644)
+            _atomic_text(bouquet_index, "\n".join(existing) + "\n", 0o644)
+
+            # Category exports now publish the same EPGImport mapping as full exports.
+            # Previously the bouquet could play perfectly but ChannelSelection had no EPG source.
+            os.makedirs(EPGIMPORT_DIR, mode=0o755, exist_ok=True)
+            channel_xml = ['<?xml version="1.0" encoding="utf-8"?>', '<channels>']
+            for map_key, map_row in existing_channels.items():
+                if not isinstance(map_row, dict):
+                    continue
+                map_row["_receiver_media_type"] = "itv"
+                map_ref = _service_ref(_proxy_url(pkey, map_key, port, token), service_type, identity=map_key)
+                channel_xml.append('  <channel id="%s">%s</channel>' % (escape(_xmltv_id(pkey, map_key), {'"': '&quot;'}), escape(map_ref)))
+            channel_xml.append('</channels>')
+            xmltv_url = _xmltv_url(pkey, port, token)
+            source_xml = (
+                '<?xml version="1.0" encoding="utf-8"?>\n<sources>\n'
+                '  <sourcecat sourcecatname="Ultra Stalker">\n'
+                '    <source type="gen_xmltv" nocheck="1" channels="%s">\n'
+                '      <description>%s</description>\n      <url>%s</url>\n'
+                '    </source>\n  </sourcecat>\n</sources>\n'
+            ) % (escape(shared_paths["epg_channels"]), escape("Ultra Stalker - " + _safe_name(profile.get("name") or profile.get("portal") or "Portal")), escape(xmltv_url))
+            _atomic_text(shared_paths["epg_channels"], "\n".join(channel_xml) + "\n", 0o644)
+            _atomic_text(shared_paths["epg_source"], source_xml, 0o644)
+
+            exports = dict(entry.get("category_exports") or {})
+            exports[digest] = {
+                "category_id": identity, "category_name": label,
+                "bouquet_name": bouquet_name, "channels": exported_keys,
+                "updated_at": int(time.time()),
+            }
+            registry["_meta"] = {"format": 2, "proxy_port": port, "updated_at": int(time.time())}
+            registry[pkey] = {
+                "profile": profile,
+                "service_type": int(service_type or entry.get("service_type") or 4097),
+                "channels": existing_channels,
+                "updated_at": int(time.time()),
+                "epg_hours": max(2, min(24, int(load_settings().get("epg_hours", 4) or 4))),
+                "proxy_port": port,
+                "proxy_token": token,
+                "category_exports": exports,
+            }
+            _write_registry(registry)
+
+        _ensure_xmltv_placeholder(pkey)
+        refresh_xmltv_async(pkey, force=True)
+        return {
+            "profile_key": pkey, "channels": len(rows), "bouquet": bouquet_path,
+            "bouquet_name": bouquet_name, "category": label, "proxy_port": port,
+        }
+    except Exception:
+        for path in reversed(touched):
+            _restore_snapshot(path, snapshots[path])
+        if proxy_started_for_export and not old_entries:
+            try: stop_proxy_server()
+            except Exception as exc: LOG.debug("Category bouquet rollback proxy stop failed: %s", exc)
+        raise
+
+
+def export_receiver_items(profile, items, media_type, label=None, service_type=4097):
+    """Append selected Live/VOD/Episode items to a receiver-side bouquet.
+
+    The bouquet always uses stable loopback proxy references so expiring provider
+    links are resolved only when Enigma2 tunes the item. Cached artwork is
+    published as a native picon when the caller supplies _receiver_picon_local.
+    """
+    profile = dict(profile or {})
+    media_type = str(media_type or "itv").lower()
+    if media_type == "movie":
+        media_type = "vod"
+    if media_type not in ("itv", "vod", "episode"):
+        raise ValueError("Unsupported receiver media type: %s" % media_type)
+    rows = [dict(row) for row in (items or []) if isinstance(row, dict) and (row.get("cmd") or row.get("command") or row.get("url"))]
+    if not rows:
+        raise ValueError("No playable items to export")
+
+    pkey = _profile_key(profile)
+    group = "live" if media_type == "itv" else ("movies" if media_type == "vod" else "series")
+    bouquet_name = "userbouquet.ultrastalker_%s_smart_%s.tv" % (pkey, group)
+    bouquet_path = os.path.join(ENIGMA2_DIR, bouquet_name)
+    bouquet_index = os.path.join(ENIGMA2_DIR, "bouquets.tv")
+    shared_paths = _bouquet_paths(pkey)
+    touched = [bouquet_path, bouquet_index, REGISTRY_FILE]
+    if media_type == "itv":
+        touched += [shared_paths["epg_channels"], shared_paths["epg_source"]]
+    snapshots = {path: _snapshot_file(path) for path in touched}
+    old_registry = _read_registry()
+    old_entries = _registry_entries(old_registry)
+    proxy_started_for_export = False
+
+    try:
+        with _REGISTRY_LOCK:
+            registry = _read_registry()
+            port = _choose_export_port(registry)
+            was_running = _SERVER is not None
+            start_proxy_server(port=port, require_registry=False, strict=True)
+            proxy_started_for_export = not was_running and _SERVER is not None
+
+            entry = dict(registry.get(pkey) or {})
+            channels = dict(entry.get("channels") or {})
+            token = str(entry.get("proxy_token") or "") or _new_proxy_token()
+            smart = dict(entry.get("smart_exports") or {})
+            saved = dict((smart.get(group) or {}).get("items") or {})
+
+            for row in rows:
+                row["_receiver_media_type"] = media_type
+                ckey = _channel_key(row)
+                channels[ckey] = row
+                saved[ckey] = True
+
+            display_label = _safe_name(label or ("Live" if group == "live" else ("Movies" if group == "movies" else "Series")))
+            bouquet_lines = ["#NAME %s" % display_label]
+            for ckey in saved:
+                row = channels.get(ckey)
+                if not isinstance(row, dict):
+                    continue
+                row_type = str(row.get("_receiver_media_type") or media_type).lower()
+                ref = _service_ref(_proxy_url(pkey, ckey, port, token), service_type, identity=ckey)
+                name = _receiver_name(row, row_type)
+                bouquet_lines.append("#SERVICE %s:%s" % (ref, name))
+                bouquet_lines.append("#DESCRIPTION %s" % name)
+                (_publish_picon(ref, row.get("_receiver_picon_local")) if row_type == "itv" else _queue_picon_publish(ref, row.get("_receiver_picon_local")))
+
+            try:
+                with open(bouquet_index, "r", encoding="utf-8", errors="replace") as handle:
+                    existing = handle.read().splitlines()
+            except OSError:
+                existing = ["#NAME Bouquets (TV)"]
+            include = '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "%s" ORDER BY bouquet' % bouquet_name
+            if not any(bouquet_name in line for line in existing):
+                existing.append(include)
+            _atomic_text(bouquet_path, "\n".join(bouquet_lines) + "\n", 0o644)
+            _atomic_text(bouquet_index, "\n".join(existing) + "\n", 0o644)
+
+            smart[group] = {"bouquet_name": bouquet_name, "items": saved, "updated_at": int(time.time())}
+            registry["_meta"] = {"format": 2, "proxy_port": port, "updated_at": int(time.time())}
+            registry[pkey] = {
+                "profile": profile,
+                "service_type": int(service_type or entry.get("service_type") or 4097),
+                "channels": channels,
+                "updated_at": int(time.time()),
+                "epg_hours": max(2, min(24, int(load_settings().get("epg_hours", 4) or 4))),
+                "proxy_port": port,
+                "proxy_token": token,
+                "category_exports": dict(entry.get("category_exports") or {}),
+                "smart_exports": smart,
+            }
+            _write_registry(registry)
+
+        if media_type == "itv":
+            # Reuse the normal profile EPGImport mapping for Smart Live items.
+            entry = _read_registry().get(pkey) or {}
+            channels = entry.get("channels") or {}
+            token = str(entry.get("proxy_token") or "")
+            port = int(entry.get("proxy_port") or _registry_port())
+            channel_xml = ['<?xml version="1.0" encoding="utf-8"?>', '<channels>']
+            for ckey, row in channels.items():
+                if not isinstance(row, dict) or str(row.get("_receiver_media_type") or "itv").lower() != "itv":
+                    continue
+                ref = _service_ref(_proxy_url(pkey, ckey, port, token), service_type, identity=ckey)
+                channel_xml.append('  <channel id="%s">%s</channel>' % (escape(_xmltv_id(pkey, ckey), {'"': '&quot;'}), escape(ref)))
+            channel_xml.append('</channels>')
+            os.makedirs(EPGIMPORT_DIR, mode=0o755, exist_ok=True)
+            xmltv_url = _xmltv_url(pkey, port, token)
+            source_xml = (
+                '<?xml version="1.0" encoding="utf-8"?>\n<sources>\n'
+                '  <sourcecat sourcecatname="Ultra Stalker">\n'
+                '    <source type="gen_xmltv" nocheck="1" channels="%s">\n'
+                '      <description>%s</description>\n      <url>%s</url>\n'
+                '    </source>\n  </sourcecat>\n</sources>\n'
+            ) % (escape(shared_paths["epg_channels"]), escape("Ultra Stalker - " + _safe_name(profile.get("name") or profile.get("portal") or "Portal")), escape(xmltv_url))
+            _atomic_text(shared_paths["epg_channels"], "\n".join(channel_xml) + "\n", 0o644)
+            _atomic_text(shared_paths["epg_source"], source_xml, 0o644)
+            _ensure_xmltv_placeholder(pkey)
+            refresh_xmltv_async(pkey, force=True)
+
+        return {"profile_key": pkey, "items": len(rows), "bouquet": bouquet_path, "bouquet_name": bouquet_name, "group": group}
+    except Exception:
+        for path in reversed(touched):
+            _restore_snapshot(path, snapshots[path])
+        if proxy_started_for_export and not old_entries:
+            try: stop_proxy_server()
+            except Exception as exc: LOG.debug("Smart receiver export rollback proxy stop failed: %s", exc)
+        raise
+
+
+
+def export_series_category_bouquets(profile, series_groups, category_name, category_id=None, service_type=4097):
+    """Export one Series category as a parent bouquet containing one child bouquet per series.
+
+    series_groups: [{"name": str, "poster": path, "episodes": [playable rows]}]
+    This deliberately leaves Live export untouched and writes all files atomically before
+    publishing cached artwork in the background.
+    """
+    profile = dict(profile or {})
+    groups = []
+    for group in (series_groups or []):
+        if not isinstance(group, dict):
+            continue
+        episodes = [dict(row) for row in (group.get("episodes") or [])
+                    if isinstance(row, dict) and (row.get("cmd") or row.get("command") or row.get("url"))]
+        if not episodes:
+            continue
+        groups.append({"name": _safe_name(group.get("name") or "Series"),
+                       "poster": str(group.get("poster") or ""), "episodes": episodes})
+    if not groups:
+        raise ValueError("No playable series episodes to export")
+
+    pkey = _profile_key(profile)
+    label = _safe_name(category_name or "Series")
+    identity = str(category_id or label or "series")
+    digest = hashlib.sha1(identity.encode("utf-8", "ignore")).hexdigest()[:10]
+    parent_name = "userbouquet.ultrastalker_%s_seriescat_%s.tv" % (pkey, digest)
+    parent_path = os.path.join(ENIGMA2_DIR, parent_name)
+    bouquet_index = os.path.join(ENIGMA2_DIR, "bouquets.tv")
+    old_flat_name = "userbouquet.ultrastalker_%s_smart_series.tv" % pkey
+    old_flat_path = os.path.join(ENIGMA2_DIR, old_flat_name)
+
+    child_specs = []
+    for pos, group in enumerate(groups):
+        sdigest = hashlib.sha1((identity + "|" + group["name"] + "|" + str(pos)).encode("utf-8", "ignore")).hexdigest()[:10]
+        child_name = "userbouquet.ultrastalker_%s_series_%s.tv" % (pkey, sdigest)
+        child_specs.append((group, child_name, os.path.join(ENIGMA2_DIR, child_name)))
+
+    touched = [parent_path, bouquet_index, old_flat_path, REGISTRY_FILE] + [x[2] for x in child_specs]
+    snapshots = {path: _snapshot_file(path) for path in touched}
+    old_registry = _read_registry()
+    old_entries = _registry_entries(old_registry)
+    proxy_started_for_export = False
+    pending_picons = []
+
+    try:
+        with _REGISTRY_LOCK:
+            registry = _read_registry()
+            port = _choose_export_port(registry)
+            was_running = _SERVER is not None
+            start_proxy_server(port=port, require_registry=False, strict=True)
+            proxy_started_for_export = not was_running and _SERVER is not None
+            entry = dict(registry.get(pkey) or {})
+            channels = dict(entry.get("channels") or {})
+            token = str(entry.get("proxy_token") or "") or _new_proxy_token()
+
+            parent_lines = ["#NAME %s" % label]
+            total = 0
+            export_children = []
+            for group, child_name, child_path in child_specs:
+                child_lines = ["#NAME %s" % group["name"]]
+                episode_keys = []
+                for row in group["episodes"]:
+                    row["_receiver_media_type"] = "episode"
+                    ckey = _channel_key(row)
+                    channels[ckey] = row
+                    episode_keys.append(ckey)
+                    ref = _service_ref(_proxy_url(pkey, ckey, port, token), service_type, identity=ckey)
+                    name = _receiver_name(row, "episode")
+                    child_lines.append("#SERVICE %s:%s" % (ref, name))
+                    child_lines.append("#DESCRIPTION %s" % name)
+                    poster = str(row.get("_receiver_picon_local") or group.get("poster") or "")
+                    if poster:
+                        pending_picons.append((ref, poster))
+                    total += 1
+                _atomic_text(child_path, "\n".join(child_lines) + "\n", 0o644)
+                parent_lines.append('#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "%s" ORDER BY bouquet' % child_name)
+                parent_lines.append("#DESCRIPTION %s" % group["name"])
+                export_children.append({"name": group["name"], "bouquet_name": child_name, "episodes": episode_keys})
+
+            _atomic_text(parent_path, "\n".join(parent_lines) + "\n", 0o644)
+            try:
+                with open(bouquet_index, "r", encoding="utf-8", errors="replace") as handle:
+                    existing = handle.read().splitlines()
+            except OSError:
+                existing = ["#NAME Bouquets (TV)"]
+            include = '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "%s" ORDER BY bouquet' % parent_name
+            existing = [line for line in existing if old_flat_name not in line]
+            if not any(parent_name in line for line in existing):
+                existing.append(include)
+            _atomic_text(bouquet_index, "\n".join(existing) + "\n", 0o644)
+            try:
+                if os.path.isfile(old_flat_path):
+                    os.unlink(old_flat_path)
+                    _fsync_parent_dir(old_flat_path)
+            except OSError:
+                pass
+
+            exports = dict(entry.get("series_category_exports") or {})
+            exports[digest] = {"category_id": identity, "category_name": label, "bouquet_name": parent_name,
+                               "children": export_children, "updated_at": int(time.time())}
+            registry["_meta"] = {"format": 2, "proxy_port": port, "updated_at": int(time.time())}
+            registry[pkey] = {
+                "profile": profile,
+                "service_type": int(service_type or entry.get("service_type") or 4097),
+                "channels": channels,
+                "updated_at": int(time.time()),
+                "epg_hours": max(2, min(24, int(load_settings().get("epg_hours", 4) or 4))),
+                "proxy_port": port,
+                "proxy_token": token,
+                "category_exports": dict(entry.get("category_exports") or {}),
+                "series_category_exports": exports,
+                "smart_exports": dict(entry.get("smart_exports") or {}),
+            }
+            _write_registry(registry)
+
+        for ref, poster in pending_picons:
+            _queue_picon_publish(ref, poster)
+        return {"profile_key": pkey, "items": total, "series": len(groups), "bouquet": parent_path,
+                "bouquet_name": parent_name, "category": label, "proxy_port": port}
+    except Exception:
+        for path in reversed(touched):
+            _restore_snapshot(path, snapshots[path])
+        if proxy_started_for_export and not old_entries:
+            try: stop_proxy_server()
+            except Exception as exc: LOG.debug("Series category rollback proxy stop failed: %s", exc)
+        raise
+
+
 def unexport_live_integration(profile_or_key, reload=True):
     """Remove one portal's bouquet, EPGImport files, XMLTV cache and registry row."""
     pkey = str(profile_or_key or "") if isinstance(profile_or_key, str) else _profile_key(profile_or_key or {})
@@ -484,11 +950,25 @@ def unexport_live_integration(profile_or_key, reload=True):
         except OSError:
             pass
 
+    # Also remove any per-category Live bouquets owned by this profile.
+    category_prefix = "userbouquet.ultrastalker_%s_cat_" % pkey
+    try:
+        for name in os.listdir(ENIGMA2_DIR):
+            if not (name.startswith(category_prefix) and name.endswith(".tv")):
+                continue
+            path = os.path.join(ENIGMA2_DIR, name)
+            try:
+                os.unlink(path); _fsync_parent_dir(path); removed.append(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
     bouquet_index = os.path.join(ENIGMA2_DIR, "bouquets.tv")
     try:
         with open(bouquet_index, "r", encoding="utf-8", errors="replace") as handle:
             lines = handle.read().splitlines()
-        filtered = [line for line in lines if paths["bouquet_name"] not in line]
+        filtered = [line for line in lines if paths["bouquet_name"] not in line and category_prefix not in line]
         if filtered != lines:
             _atomic_text(bouquet_index, "\n".join(filtered) + "\n", 0o644)
     except OSError:
@@ -887,7 +1367,8 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_text(404, "Unknown channel")
                     return
                 client = _client(entry.get("profile") or {})
-                try: url = client.create_link(channel, "itv")
+                media_type = str(channel.get("_receiver_media_type") or "itv").lower()
+                try: url = client.create_link(channel, media_type)
                 finally:
                     try: client.close()
                     except Exception as exc: LOG.debug("Bouquet proxy client close failed: %s", exc)
