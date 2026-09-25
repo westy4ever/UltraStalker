@@ -23,7 +23,7 @@ import zlib
 from .persistent_cache import ROOT as _PERSISTENT_ROOT, hdd_ready, ensure_persistent_dirs
 from .securefs import secure_private_dir
 from .netsec import provider_urlopen
-from .log import diagnostic_failure
+from .log import diagnostic_failure, get_logger
 
 try:
     from .title_clean import clean_title as _portal_clean_title
@@ -31,11 +31,7 @@ except Exception:
     def _portal_clean_title(value):
         return str(value or "").strip()
 
-try:
-    from .log import LOG
-except Exception:
-    import logging
-    LOG=logging.getLogger("UltraStalker.M3U")
+LOG = get_logger()
 
 _CACHE_ROOT=os.path.join(_PERSISTENT_ROOT,"m3u")
 _MEM_LOCK=threading.RLock()
@@ -79,6 +75,14 @@ def _prepare_private_read(path):
         return False
 
 _MODE_HINTS={}
+
+
+def shutdown_m3u_workers(wait=False):
+    try:_SERIES_PERSIST_EXECUTOR.shutdown(wait=bool(wait),cancel_futures=True)
+    except TypeError:
+        try:_SERIES_PERSIST_EXECUTOR.shutdown(wait=bool(wait))
+        except Exception as exc:LOG.warning("M3U persist executor shutdown fallback failed: %s",exc)
+    except Exception as exc:LOG.warning("M3U persist executor shutdown failed: %s",exc)
 
 class _SafeCacheUnpickler(pickle.Unpickler):
     """Unpickle only plain built-in container/scalar data from plugin-owned caches."""
@@ -206,6 +210,83 @@ class M3UClient:
 
     def reset_failure_backoff(self):
         return None
+
+    def _clear_catalogue_cache_files(self):
+        """Remove this source's catalogue/index caches only; artwork stays untouched."""
+        removed=0
+        prefix=self._cache_key()
+        paths=(self._cache_path(),self._fast_cache_path())
+        for path in paths:
+            try:
+                if os.path.isfile(path):
+                    os.unlink(path);removed+=1
+            except OSError as exc:
+                LOG.debug("M3U refresh cache remove failed %s: %s",os.path.basename(path),exc)
+        try:
+            if os.path.isdir(_CACHE_ROOT):
+                cat_prefix=prefix+".cat."
+                for name in os.listdir(_CACHE_ROOT):
+                    if not (name.startswith(cat_prefix) and name.endswith(".pkl")):
+                        continue
+                    path=os.path.join(_CACHE_ROOT,name)
+                    try:
+                        if os.path.isfile(path):os.unlink(path);removed+=1
+                    except OSError as exc:
+                        LOG.debug("Xtream category refresh cache remove failed %s: %s",name,exc)
+        except OSError as exc:
+            LOG.debug("M3U refresh cache directory scan failed: %s",exc)
+        return removed
+
+    def refresh_content(self,cancel_event=None):
+        """Force a fresh M3U/Xtream catalogue bootstrap for this exact source.
+
+        Direct M3U sources download and re-parse the playlist immediately. Xtream
+        sources refresh account/category bootstrap and discard lazy category + rich
+        series-info caches so the next folder/series open must hit the provider.
+        Persistent artwork, TMDB metadata and title logos are intentionally preserved.
+        """
+        # Let any in-flight coalesced series persistence finish before deleting
+        # this source's catalogue files, otherwise an older snapshot could win a
+        # last-millisecond os.replace() after the explicit refresh starts.
+        deadline=time.monotonic()+12.0
+        while True:
+            with self._series_persist_lock:
+                running=bool(self._series_persist_running)
+                if not running:self._series_persist_dirty=False
+            if not running:break
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Content refresh cancelled")
+            if time.monotonic()>=deadline:
+                raise RuntimeError("Content refresh is waiting for catalogue storage to finish")
+            time.sleep(0.05)
+        with self._lock:
+            removed=self._clear_catalogue_cache_files()
+            self._loaded=False;self._loaded_at=0.0;self._cache_stale=False
+            self._items={"itv":[],"vod":[],"series":[]}
+            self._genres={"itv":[],"vod":[],"series":[]}
+            self._series_index={}
+            self._xtream_categories={"itv":{},"vod":{},"series":{}}
+            self._xtream_category_ids={"itv":{},"vod":{},"series":{}}
+            self._xtream_loaded_categories={"itv":set(),"vod":set(),"series":set()}
+            self._xtream_info_cache={}
+            self._xtream_live_art_index=None
+            self._xtream_series_name_index=None
+            self._last_error=""
+            self._ensure(cancel_event=cancel_event,force=True)
+            mode=str(self._mode or "m3u").lower()
+            # For Xtream, content lists are intentionally lazy. Their per-category
+            # caches were deleted above, so every opened folder is now provider-fresh.
+            # Direct M3U has already rebuilt all rows during _ensure(force=True).
+            counts={k:len(v or []) for k,v in self._items.items()}
+            categories={k:len(v or []) for k,v in self._genres.items()}
+            return {
+                "ok":True,
+                "source":"Xtream" if mode=="xtream" else "M3U",
+                "mode":mode,
+                "items":counts,
+                "categories":categories,
+                "removed_catalogue_cache_files":removed,
+            }
 
     def _cache_key(self):
         return hashlib.sha1(self.url.encode("utf-8","ignore")).hexdigest()
@@ -554,7 +635,17 @@ class M3UClient:
                 headers["Accept"]="application/json,text/plain,*/*"
                 req=urllib.request.Request(url,headers=headers)
                 with provider_urlopen(req,timeout=max(5,int(timeout or self.full_timeout))) as response:
-                    raw=response.read(32*1024*1024)
+                    # OpenATV 8.0 compatibility: read large Xtream catalogues in
+                    # bounded chunks so BACK/cancel can be observed between socket
+                    # reads instead of one monolithic 32 MiB read.
+                    chunks=[];total=0;limit=32*1024*1024
+                    while total < limit:
+                        if cancel_event is not None and cancel_event.is_set():
+                            return None
+                        chunk=response.read(min(256*1024,limit-total))
+                        if not chunk:break
+                        chunks.append(chunk);total+=len(chunk)
+                    raw=b"".join(chunks)
                     encoding=str(response.info().get("Content-Encoding") or "")
                 if cancel_event is not None and cancel_event.is_set():
                     return None
@@ -667,12 +758,18 @@ class M3UClient:
                 pass
             return False
 
-    def _normalise_xtream_rows(self, kind, rows, category_id=""):
+    def _normalise_xtream_rows(self, kind, rows, category_id="", cancel_event=None):
         kind=str(kind or "itv").lower()
         out=[]
         mapping=self._xtream_categories.get(kind,{})
         forced_cid=str(category_id or "")
         for pos,row in enumerate(rows if isinstance(rows,list) else []):
+            if cancel_event is not None and cancel_event.is_set():
+                return out
+            # Cooperative yield keeps Enigma2 responsive on slower OpenATV 8.0
+            # receivers while normalising very large Live categories.
+            if pos and (pos & 63)==0:
+                time.sleep(0)
             if not isinstance(row,dict):continue
             cid=str(row.get("category_id") or forced_cid or "")
             group=mapping.get(cid) or str(row.get("category_name") or "Other")
@@ -798,7 +895,7 @@ class M3UClient:
         if cid:return str(cid)
         return ""
 
-    def _load_xtream_category(self, kind, genre="*", cancel_event=None, force=False):
+    def _load_xtream_category(self, kind, genre="*", cancel_event=None, force=False, request_timeout=None):
         kind=str(kind or "itv").lower()
         self._ensure(cancel_event)
         cid=self._xtream_category_id(kind,genre)
@@ -833,8 +930,10 @@ class M3UClient:
         extra={"category_id":cid} if cid else None
         started=time.monotonic()
         LOG.info("Xtream route kind=%s requested=%r category_id=%s action=%s",kind,genre,cid or "*",action)
-        raw=self._xtream_request(action,extra,timeout=self.full_timeout,cancel_event=cancel_event)
-        rows=self._normalise_xtream_rows(kind,raw,cid)
+        raw=self._xtream_request(action,extra,timeout=(request_timeout if request_timeout is not None else self.full_timeout),cancel_event=cancel_event)
+        rows=self._normalise_xtream_rows(kind,raw,cid,cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return rows
         self._write_xtream_category_cache(kind,cache_key,rows)
         self._xtream_loaded_categories.setdefault(kind,set()).add(cache_key)
         LOG.info("Xtream lazy category kind=%s category=%s rows=%s elapsed_ms=%s",
@@ -929,10 +1028,20 @@ class M3UClient:
         if allow_cache and not self._loaded and self._read_persistent():
             return {"ok":True,"mode":self._mode,"status":200,"cached":True}
 
-        # Once this URL proved to be Xtream, never waste 20-60 seconds on the
-        # known-bad get.php path again. The mode survives GUI exits and reboots.
-        if self._mode=="xtream" and self._xtream:
-            return self._xtream_probe(cancel_event)
+        # Credentialed get.php URLs are usually Xtream. Probe player_api.php
+        # first: it is tiny and avoids downloading/probing a multi-megabyte M3U
+        # before Home can open. If the provider does not expose Xtream API we
+        # fall back to the exact legacy M3U probe below.
+        if self._xtream:
+            try:
+                result=self._xtream_probe(cancel_event)
+                LOG.info("M3U source accepted through Xtream-first probe")
+                return result
+            except Exception as xtream_first_exc:
+                if self._mode=="xtream":
+                    LOG.warning("Remembered Xtream probe failed; falling back to M3U probe: %s",xtream_first_exc)
+                else:
+                    LOG.info("Xtream-first probe unavailable; trying M3U payload: %s",xtream_first_exc)
 
         last_exc=None
         for browser in (False,True):
@@ -1128,11 +1237,21 @@ class M3UClient:
             if self._loaded and not force:return
             if not force and self._read_persistent():return
 
-            # If a prior probe already identified Xtream mode, skip get.php.
-            if self._mode=="xtream" and self._xtream:
-                self._load_xtream(cancel_event)
-                self._write_persistent()
-                return
+            # Credentialed get.php URLs should bootstrap through the tiny Xtream
+            # API first. A successful player_api probe avoids downloading/parsing
+            # the entire M3U merely to open Home or display categories. Providers
+            # without Xtream API still fall through to the original M3U path.
+            if self._xtream:
+                try:
+                    self._xtream_probe(cancel_event)
+                    self._load_xtream(cancel_event)
+                    self._write_persistent()
+                    return
+                except Exception as xtream_boot_exc:
+                    if self._mode=="xtream":
+                        LOG.warning("Xtream bootstrap failed; trying M3U payload: %s",xtream_boot_exc)
+                    else:
+                        LOG.info("Xtream bootstrap unavailable; trying M3U payload: %s",xtream_boot_exc)
 
             try:
                 text=self._fetch(cancel_event)
@@ -1190,6 +1309,8 @@ class M3UClient:
                 "playlist_mode":"xtream",
                 "expire_billing_date":exp,
                 "end_date":exp,
+                "active_cons":user.get("active_cons"),
+                "max_connections":user.get("max_connections"),
                 "playlist_items":sum(len(v) for v in self._items.values()) if self._loaded else 0,
             }
         self._ensure()
@@ -1287,12 +1408,18 @@ class M3UClient:
             for key,value in origin.items():
                 if self._first_info_value(value):
                     src[key]=value
-        if kind=="series":
-            # Xstreamity-style rich-series priority: server cover_big first.
-            cover=self._first_info_value(src.get("cover_big"),src.get("cover"),src.get("movie_image"),src.get("cover_tmdb"),src.get("stream_icon"))
-        else:
-            # Xstreamity 5.58 reference order for VOD provider artwork.
-            cover=self._first_info_value(src.get("cover_big"),src.get("movie_image"),src.get("cover_tmdb"),src.get("cover"),src.get("stream_icon"))
+        # Ultra Stalker keeps a deterministic provider-cover policy per media type.
+        # The policy is expressed locally so catalogue normalization is independent
+        # from any external plugin implementation.
+        cover_fields={
+            "series":("cover_big","cover","movie_image","cover_tmdb","stream_icon"),
+            "vod":("cover_big","movie_image","cover_tmdb","cover","stream_icon"),
+        }
+        cover=""
+        for field in cover_fields["series" if kind=="series" else "vod"]:
+            cover=self._first_info_value(src.get(field))
+            if cover:
+                break
         backdrop=self._first_info_value(src.get("backdrop_path"),src.get("backdrop"),src.get("backdrops"),src.get("background"),src.get("fanart"))
         if cover:
             cover=str(cover)
@@ -1499,6 +1626,123 @@ class M3UClient:
         if isinstance(item,dict):
             return str(item.get("url") or item.get("cmd") or item.get("command") or "")
         return str(item or "")
+
+    def search_content_fast(self,query,media_types=("vod","series"),limit=80,max_pages=40,cancel_event=None,time_budget=8,on_partial=None):
+        """Progressive Movies/Series search for plain M3U and Xtream sources.
+
+        Xtream panels are not consistent about returning the whole catalogue when
+        ``get_vod_streams`` / ``get_series`` is called without ``category_id``.
+        Browsing already uses the provider category IDs, so global search must use
+        that same authoritative route instead of assuming the optional all-catalog
+        form works.  Cached category rows are scanned first; uncached categories
+        are then loaded one by one and matches are published immediately.
+        """
+        needle=" ".join(str(query or "").casefold().replace("_"," ").replace("-"," ").split())
+        if not needle:return []
+        limit=max(1,int(limit or 80))
+        search_deadline=time.monotonic()+max(8.0,float(time_budget or 8.0))
+        out=[];seen=set()
+
+        def publish_rows(rows,typ):
+            for row in rows or []:
+                if cancel_event is not None and cancel_event.is_set():return True
+                if not isinstance(row,dict):continue
+                hay=" ".join((str(row.get("name") or row.get("title") or "")+" "+str(row.get("description") or row.get("descr") or row.get("plot") or "")).casefold().replace("_"," ").replace("-"," ").split())
+                if needle not in hay:continue
+                ident=str(row.get("id") or row.get("stream_id") or row.get("series_id") or row.get("url") or row.get("name") or row.get("title") or "")
+                key=(str(typ),ident)
+                if key in seen:continue
+                seen.add(key)
+                item=dict(row);item["_search_media_type"]=typ;out.append(item)
+                if callable(on_partial):
+                    try:on_partial([dict(item)])
+                    except Exception:pass
+                if len(out)>=limit:return True
+            return False
+
+        # Credentialed Xtream sources use the exact category routing that powers
+        # the normal browser.  This works on panels that return [] for the
+        # non-standard "all categories" request and makes existing HDD category
+        # caches immediately searchable.
+        if self._xtream:
+            self._ensure(cancel_event)
+            for typ in tuple(str(x).lower() for x in media_types):
+                if typ=="live":typ="itv"
+                if typ not in ("itv","vod","series"):continue
+                if cancel_event is not None and cancel_event.is_set():break
+                mapping=dict(self._xtream_categories.get(typ,{}) or {})
+                if not mapping:
+                    try:
+                        self._load_xtream(cancel_event)
+                        mapping=dict(self._xtream_categories.get(typ,{}) or {})
+                    except Exception as exc:
+                        LOG.warning("Xtream search category bootstrap failed %s: %s",typ,exc)
+                # Search previously opened/cached folders first, so repeat searches
+                # and normal browse->search transitions produce instant matches.
+                pending=[]
+                for cid in mapping.keys():
+                    if cancel_event is not None and cancel_event.is_set():break
+                    cached=self._read_xtream_category_cache(typ,cid)
+                    if isinstance(cached,list):
+                        if publish_rows(cached,typ):return out
+                    else:
+                        pending.append(str(cid))
+
+                # Some panels do support an all-catalog call.  Use it as a fast
+                # bridge only when it has already been cached; never depend on it.
+                cached_all=self._read_xtream_category_cache(typ,"*")
+                if isinstance(cached_all,list) and publish_rows(cached_all,typ):return out
+
+                # Fetch the real provider categories progressively.  The outer
+                # federated-search worker owns cancellation/deadline policy; each
+                # successful folder is persisted by _load_xtream_category(), so
+                # future searches become HDD-local.
+                for cid in pending:
+                    if cancel_event is not None and cancel_event.is_set():break
+                    remain=search_deadline-time.monotonic()
+                    if remain<=0:break
+                    try:rows=self._load_xtream_category(typ,cid,cancel_event,request_timeout=max(5,min(12,int(remain)))) or []
+                    except Exception as exc:
+                        LOG.debug("Xtream search category failed %s/%s: %s",typ,cid,exc)
+                        continue
+                    if publish_rows(rows,typ):return out
+            return out
+
+        # Plain M3U keeps the original local-catalogue path.
+        for typ in tuple(str(x).lower() for x in media_types):
+            if typ=="live":typ="itv"
+            if cancel_event is not None and cancel_event.is_set():break
+            try:rows=self.ordered_all(typ,"*",start_page=1,max_pages=max_pages,max_items=max(300,limit*12),cancel_event=cancel_event) or []
+            except Exception:rows=[]
+            if publish_rows(rows,typ):return out
+        return out
+
+    def search_category_fast(self,query,media_type="vod",category="*",limit=120,max_pages=18,cancel_event=None,time_budget=5):
+        """Search one M3U/Xtream folder only.
+
+        Xtream category loading is already lazy/persistently cached, so this is
+        normally one category request (or HDD/RAM hit) followed by a local scan.
+        Plain M3U sources are scanned from their already parsed local catalogue.
+        """
+        needle=" ".join(str(query or "").casefold().replace("_"," ").replace("-"," ").split())
+        if not needle:return []
+        typ=str(media_type or "vod").lower();category=str(category if category not in (None,"") else "*")
+        try:rows=self.ordered_all(typ,category,start_page=1,max_pages=max_pages,max_items=self.MAX_ITEMS if hasattr(self,"MAX_ITEMS") else 50000,cancel_event=cancel_event) or []
+        except Exception:rows=[]
+        out=[];seen=set()
+        for row in rows:
+            if cancel_event is not None and cancel_event.is_set():break
+            if not isinstance(row,dict):continue
+            hay=" ".join((str(row.get("name") or row.get("title") or "")+" "+str(row.get("description") or row.get("descr") or "")).casefold().replace("_"," ").replace("-"," ").split())
+            if needle not in hay:continue
+            ident=str(row.get("id") or row.get("stream_id") or row.get("series_id") or row.get("url") or row.get("name") or row.get("title") or "")
+            if ident in seen:continue
+            seen.add(ident);item=dict(row);item["_search_media_type"]=typ;out.append(item)
+            if len(out)>=int(limit):break
+        return out
+
+    def search_content(self,query,media_types=("vod","series"),limit=80,max_pages=40,cancel_event=None,time_budget=8):
+        return self.search_content_fast(query,media_types,limit,max_pages,cancel_event,time_budget)
 
     def epg(self,*args,**kwargs):return []
     def full_epg(self,*args,**kwargs):return []

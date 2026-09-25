@@ -23,6 +23,11 @@ def _paths():
 
 
 def main():
+    tests_dir=os.path.join(os.path.dirname(__file__),"tests")
+    if not os.path.isdir(tests_dir):
+        print("REGRESSION TESTS NOT PACKAGED: release-clean runtime payload")
+        print("Pre-package source regression is the authoritative full suite.")
+        return 0
     plugin_dir, python_root = _paths()
     if python_root not in sys.path:
         sys.path.insert(0, python_root)

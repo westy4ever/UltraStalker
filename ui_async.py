@@ -2,6 +2,8 @@
 
 import queue
 
+from . import _
+
 from enigma import eTimer
 
 from .core.tasks import TASKS
@@ -21,7 +23,11 @@ class AsyncScreenMixin:
                 self._poll.callback.append(self._drain_jobs)
             except Exception as exc:
                 optional_failure("ui", exc)
-        self._poll.start(90, False)
+        # Adaptive GUI delivery heartbeat: fast only while work is actually
+        # pending, relaxed while the screen is idle.  This keeps completed
+        # worker results responsive without waking Enigma2 ~8 times/sec forever.
+        self._async_poll_interval = 600
+        self._poll.start(self._async_poll_interval, False)
         try:
             self.onHide.append(self._pause_async_poll)
             self.onShow.append(self._resume_async_poll)
@@ -36,8 +42,85 @@ class AsyncScreenMixin:
         if self._screen_closed:return
         try:
             self._drain_jobs()
-            self._poll.start(90,False)
+            self._async_set_poll_interval(120 if self._async_poll_has_pending_work() else 600)
         except Exception as exc:optional_failure("ui.async_resume_poll",exc)
+
+    def _async_set_poll_interval(self, interval_ms):
+        """Keep the repeating UI heartbeat alive at the requested cadence.
+
+        PerfLab5: child screens stop ``_poll`` on hide.  On return the desired
+        interval is often unchanged (usually 600 ms), so the old equality guard
+        returned without restarting the stopped eTimer.  Background poster jobs
+        then completed normally but their result queues were never drained until
+        the whole Grid screen was reopened.
+        """
+        if self._screen_closed:return
+        try:
+            interval=max(80,int(interval_ms or 600))
+            same=int(getattr(self,"_async_poll_interval",0) or 0)==interval
+            active=False
+            try:active=bool(self._poll.isActive())
+            except Exception:active=False
+            if same and active:return
+            try:self._poll.stop()
+            except Exception:pass
+            self._async_poll_interval=interval
+            self._poll.start(interval,False)
+        except Exception as exc:optional_failure("ui.async_poll_interval",exc)
+
+    @staticmethod
+    def _async_future_pending(value):
+        try:return value is not None and hasattr(value,"done") and not value.done()
+        except Exception:return False
+
+    def _async_poll_has_pending_work(self):
+        """Cheap RAM-only pending-work probe; never touches HDD or network."""
+        if self._screen_closed:return False
+        if bool(getattr(self,"_busy",False)):return True
+        active=getattr(self,"_active_async_handle",None)
+        if active is not None:
+            try:
+                fut=getattr(active,"future",None)
+                if fut is None or not fut.done():return True
+            except Exception:return True
+        for handle in list(getattr(self,"_task_handles",[]) or []):
+            try:
+                fut=getattr(handle,"future",None)
+                if not handle.cancelled() and (fut is None or not fut.done()):return True
+            except Exception:continue
+        # Screen-local delivery queues used by Grid, Search, Details, Home, Live
+        # and Cinematic. Queue.empty() is only a memory check here.
+        for name in (
+            "_jobs","_art_prefetch_jobs","_quality_prefetch_jobs","_poster_hud_jobs",
+            "_epg_jobs","_grid_download_jobs","_grid_accent_jobs","_grid_mood_jobs",
+            "_image_jobs","_poster_jobs","_search_partial_jobs","_backdrop_jobs",
+            "_adaptive_jobs","_title_logo_jobs","_tmdb_jobs","_home_jobs",
+            "_portal_progress_jobs","_series_jobs","_preview_jobs","_live_chrome_jobs",
+            "_pgv2_hero_jobs","_pgv2_material_jobs","_page_prefetch_future_jobs"):
+            q=getattr(self,name,None)
+            if q is None:continue
+            try:
+                if not q.empty():return True
+            except Exception:continue
+        # Detached visual/network futures may still be computing while their
+        # result queue is empty; keep the fast cadence until they settle.
+        for name in (
+            "_image_future","_epg_future","_live_picon_cache_future",
+            "_pgv2_hero_future","_pgv2_material_future","_preview_handle",
+            "_hero_pin_future","_cin_focus_future","_cin_background_future"):
+            if self._async_future_pending(getattr(self,name,None)):return True
+        for name in ("_page_prefetch_futures","_poster_futures","_recent_futures","_details_worker_futures"):
+            values=getattr(self,name,None)
+            if not values:continue
+            try:
+                if any(self._async_future_pending(value) for value in list(values)):return True
+            except Exception:pass
+        futures=getattr(self,"_grid_download_futures",None)
+        if isinstance(futures,dict):
+            try:
+                if any(self._async_future_pending(value) for value in list(futures.values())):return True
+            except Exception:pass
+        return False
 
     def _run_async(self, func, ok, fail=None):
         if self._busy or self._screen_closed:
@@ -61,6 +144,8 @@ class AsyncScreenMixin:
                 if not old.cancelled() and not (old.future is not None and old.future.done())]
             self._task_handles.append(handle)
             self._active_async_handle = handle
+            # A new request must not wait for the relaxed idle heartbeat.
+            self._async_set_poll_interval(120)
         except Exception as exc:
             self._busy = False
             self._jobs.put((fail, exc, True))
@@ -112,7 +197,7 @@ class AsyncScreenMixin:
                     callback(value)
                 except Exception as exc:
                     try:
-                        self["status"].setText("UI error: %s" % exc)
+                        self["status"].setText(_("UI error: %s") % exc)
                     except Exception as exc:
                         optional_failure("ui", exc)
             elif is_error:
@@ -120,6 +205,10 @@ class AsyncScreenMixin:
                     self["status"].setText(str(value))
                 except Exception as exc:
                     optional_failure("ui", exc)
+        # Stay responsive while any worker/delivery queue is active; otherwise
+        # back off to five checks per three seconds. Hidden screens stop entirely.
+        self._async_set_poll_interval(120 if self._async_poll_has_pending_work() else 600)
+
     def _stop_async(self):
         self._screen_closed = True
         self._busy = False

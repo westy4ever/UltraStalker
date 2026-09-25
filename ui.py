@@ -10,16 +10,39 @@ import urllib.request
 import urllib.error
 import time
 import json
+
+# R47: keep the proven R46 cold-start cyclic-GC guard, without profiler overhead.
 import math
 import re
 import unicodedata
 import io
 import gc
+# PERF46: Cold-start cyclic-GC guard. The R44 profiler proved that the ~255 ms
+# pause was not module work: the same generation-2 collection simply moved from
+# Downloads to Storage when Downloads became lazy.  Disable only *automatic*
+# cyclic GC while ui.py is being constructed. Normal CPython ref-counting stays
+# active. At ui_ready we do a cheap generation-0 flush and restore the receiver's
+# original GC enabled/disabled state. Thresholds and long-term GC policy are not
+# changed.
+_IMPORT46_GC_WAS_ENABLED = False
+try:
+    _IMPORT46_GC_WAS_ENABLED = bool(gc.isenabled())
+    if _IMPORT46_GC_WAS_ENABLED:
+        gc.disable()
+except Exception:
+    pass
+
 import tempfile
-import colorsys
+import shutil
+try:
+    import colorsys
+except Exception:
+    from . import compat_colorsys as colorsys
 from collections import OrderedDict
 from concurrent.futures import as_completed, ThreadPoolExecutor
-from .core.executor import LazyThreadPoolExecutor
+from .core.executor import LazyThreadPoolExecutor, PriorityLazyExecutor
+from .core.shared_executors import VISIBLE_ARTWORK_EXECUTOR, VISIBLE_PROVIDER_ARTWORK_EXECUTOR, CATALOGUE_EXECUTOR, METADATA_EXECUTOR, CACHE_IO_EXECUTOR
+from .core.image_budget import image_work
 
 try:
     from PIL import Image as _PILImage, ImageOps as _PILImageOps, ImageFilter as _PILImageFilter, ImageChops as _PILImageChops, ImageDraw
@@ -70,11 +93,53 @@ from enigma import (
 from . import _
 from .client import StalkerClient
 from .core.tasks import TASKS
-from .core.diagnostics import snapshot as diagnostic_snapshot, export as export_diagnostics, export_support_bundle
-from .core.maintenance import cache_stats as persistent_cache_stats, prune_cache as prune_persistent_cache, runtime_health
+# R112 startup/import cleanup: diagnostics, maintenance and backup are explicit
+# utility actions, not first-paint dependencies.  Keep their public callables
+# stable for the extracted screens, but import the heavy modules only on use.
+def diagnostic_snapshot(*args, **kwargs):
+    from .core.diagnostics import snapshot as _real
+    return _real(*args, **kwargs)
+
+def export_diagnostics(*args, **kwargs):
+    from .core.diagnostics import export as _real
+    return _real(*args, **kwargs)
+
+def export_support_bundle(*args, **kwargs):
+    from .core.diagnostics import export_support_bundle as _real
+    return _real(*args, **kwargs)
+
+def persistent_cache_stats(*args, **kwargs):
+    from .core.maintenance import cache_stats as _real
+    return _real(*args, **kwargs)
+
+def prune_persistent_cache(*args, **kwargs):
+    from .core.maintenance import prune_cache as _real
+    return _real(*args, **kwargs)
+
+def runtime_health(*args, **kwargs):
+    from .core.maintenance import runtime_health as _real
+    return _real(*args, **kwargs)
+
+from .core.generated_cache import maintain_generated_cache, note_generated_use
 from .core.runtime_log import breadcrumb as runtime_breadcrumb
 from .core.session import PortalSession
-from .core.backup import create_backup, restore_backup, list_backups, inspect_backup
+
+def create_backup(*args, **kwargs):
+    from .core.backup import create_backup as _real
+    return _real(*args, **kwargs)
+
+def restore_backup(*args, **kwargs):
+    from .core.backup import restore_backup as _real
+    return _real(*args, **kwargs)
+
+def list_backups(*args, **kwargs):
+    from .core.backup import list_backups as _real
+    return _real(*args, **kwargs)
+
+def inspect_backup(*args, **kwargs):
+    from .core.backup import inspect_backup as _real
+    return _real(*args, **kwargs)
+
 from .core.portal_security import requires_http_consent, HTTP_WARNING, http_warning_for, mark_http_consent
 from .ui_parts.catalog import clean_display_text as _clean_display_text, clean_live_channel_name as _clean_live_channel_name
 from .ui_helpers import (
@@ -94,6 +159,8 @@ from .ui_artwork_helpers import (
     _strip_portal_artwork,
     _verified_external_art,
     _normalize_provider_image_url,
+    _fit_live_picon_canvas,
+    _fit_live_row_picon_canvas,
 )
 from .ui_dynamic_palette import (
     _DYNAMIC_PALETTE_CACHE,
@@ -101,10 +168,50 @@ from .ui_dynamic_palette import (
     _DYNAMIC_PALETTE_CACHE_LIMIT,
     _dynamic_palette,
 )
-from .title_clean import clean_title as _clean_catalog_title, catalogue_title as _catalogue_title
+from .title_clean import clean_title as _clean_catalog_title, display_title as _catalogue_title
 from .ui_parts.settings import backup_choices, secret_backup_warning
-from .core.recording import prepare_portal_recording, install_recording_timer, event_times
-from .core.bouquets import export_live_integration, unexport_live_integration, reload_bouquets, start_proxy_server
+# Recording and bouquet integration are used only after the user enters media
+# flows or explicitly exports receiver integration.  Deferring these two large
+# modules keeps them off the cold UI-graph import without changing their APIs.
+def prepare_portal_recording(*args, **kwargs):
+    from .core.recording import prepare_portal_recording as _real
+    return _real(*args, **kwargs)
+
+def install_recording_timer(*args, **kwargs):
+    from .core.recording import install_recording_timer as _real
+    return _real(*args, **kwargs)
+
+def event_times(*args, **kwargs):
+    from .core.recording import event_times as _real
+    return _real(*args, **kwargs)
+
+def export_live_integration(*args, **kwargs):
+    from .core.bouquets import export_live_integration as _real
+    return _real(*args, **kwargs)
+
+def export_live_category_bouquet(*args, **kwargs):
+    from .core.bouquets import export_live_category_bouquet as _real
+    return _real(*args, **kwargs)
+
+def export_receiver_items(*args, **kwargs):
+    from .core.bouquets import export_receiver_items as _real
+    return _real(*args, **kwargs)
+
+def export_series_category_bouquets(*args, **kwargs):
+    from .core.bouquets import export_series_category_bouquets as _real
+    return _real(*args, **kwargs)
+
+def unexport_live_integration(*args, **kwargs):
+    from .core.bouquets import unexport_live_integration as _real
+    return _real(*args, **kwargs)
+
+def reload_bouquets(*args, **kwargs):
+    from .core.bouquets import reload_bouquets as _real
+    return _real(*args, **kwargs)
+
+def start_proxy_server(*args, **kwargs):
+    from .core.bouquets import start_proxy_server as _real
+    return _real(*args, **kwargs)
 from .core.parental import (
     is_unlocked as parental_is_unlocked, unlock as parental_unlock,
     lock_now as parental_lock_now, remaining_minutes as parental_remaining_minutes,
@@ -112,18 +219,62 @@ from .core.parental import (
     pin_is_default as parental_pin_is_default, lockout_remaining as parental_lockout_remaining,
 )
 from .version import PLUGIN_VERSION, BUILD_NAME
-from .services.player import UltraStalkerPlayer, force_session_silence
-from .downloads import MANAGER as DOWNLOADS, movie_job, episode_job
+from .receiver_video import capture_aspect_mode, restore_aspect_mode
+
+# PERF38: the native player is one of the largest modules in the plugin and is
+# irrelevant until playback actually starts.  Keep the historical dependency
+# name injected into every screen, but resolve the real class only when
+# Session.open()/openWithCallback() calls it.  This does not touch player code
+# or playback behavior; it only moves the import off the plugin cold-start path.
+def UltraStalkerPlayer(session, *args, **kwargs):
+    from .services.player import UltraStalkerPlayer as _RealUltraStalkerPlayer
+    return _RealUltraStalkerPlayer(session, *args, **kwargs)
+
+def force_session_silence(*args, **kwargs):
+    from .services.player import force_session_silence as _real_force_session_silence
+    return _real_force_session_silence(*args, **kwargs)
+
+# PERF45: Downloads are optional and must not participate in plugin cold start.
+# Importing downloads.py was the point where a full generation-2 GC pause was
+# being triggered (~255 ms on the test receiver).  Keep the historical globals
+# injected into Details/Series, but resolve the real module only on first use.
+class _LazyDownloadsFacade(object):
+    def _manager(self):
+        from .downloads import MANAGER as _MANAGER
+        return _MANAGER
+    def snapshot(self): return self._manager().snapshot()
+    def add(self, job, resolver): return self._manager().add(job, resolver)
+    def cancel(self, jid): return self._manager().cancel(jid)
+    def retry(self, jid, resolver=None): return self._manager().retry(jid, resolver)
+    def shutdown(self, wait=False, timeout=2.5): return self._manager().shutdown(wait=wait, timeout=timeout)
+
+DOWNLOADS = _LazyDownloadsFacade()
+
+def movie_job(*args, **kwargs):
+    from .downloads import movie_job as _movie_job
+    return _movie_job(*args, **kwargs)
+
+def episode_job(*args, **kwargs):
+    from .downloads import episode_job as _episode_job
+    return _episode_job(*args, **kwargs)
+
 from .tmdb import TMDBClient, TMDBError
-from .artwork_v2 import ArtworkV2, load_manifest as load_artwork_v2_manifest, canonical_art_paths, identity_cache_compatible
+from .artwork_v2 import ArtworkV2, load_manifest as load_artwork_v2_manifest, load_fast_local_poster as load_artwork_v2_fast_local_poster, load_manual_rescue_art, canonical_art_paths, identity_cache_compatible
 from .persistent_cache import load_detail_snapshot, load_shared_detail_snapshot, load_detail_snapshot_by_tmdb, load_detail_snapshot_by_imdb, save_detail_snapshot, hdd_read_ready, canonical_external_digest, content_cache_key
-from .imdb import IMDbClient, IMDbError
+# PERF41: IMDb support is optional metadata enrichment and should not make every
+# plugin cold start parse the full IMDb/AWS adapter.  Preserve the historical
+# dependency name injected into Details, but resolve the real implementation
+# only on the first actual IMDb client construction.
+def IMDbClient(*args, **kwargs):
+    from .imdb import IMDbClient as _RealIMDbClient
+    return _RealIMDbClient(*args, **kwargs)
+
 from .log import get_logger, optional_failure, diagnostic_failure, redact as _redact_log_value
 from .netsec import SafeMediaRedirectHandler, validate_remote_media_url, build_safe_media_opener, provider_urlopen
 from .ultra import (premium_title, quality_badges, load_ui_state, save_ui_state,
     one_line, epg_summary, engine_memory_count, load_content_quality, load_content_qualities, normalize_quality, remember_content_quality)
-from .storage import (load_profiles, save_profiles, disable_profiles, enable_profile, load_disabled_profiles, replace_profile, duplicate_profile, reorder_profile, permanently_delete_profile, purge_profile_data, load_theme, save_theme, THEMES, IMPORT_FILE,
-    load_favorites, toggle_favorite, is_favorite, load_content_states, load_recently_played, load_continue_watching, add_recently_played, load_playback_progress, mark_watched, remove_from_history, clear_history, load_settings, save_settings, save_tmdb_credential, update_api_keys, consume_recovery_notices)
+from .storage import (load_profiles, save_profiles, disable_profiles, enable_profile, load_disabled_profiles, replace_profile, duplicate_profile, reorder_profile, permanently_delete_profile, purge_profile_data, load_theme, save_theme, THEMES, IMPORT_FILE, load_server_library, import_server_library_profiles,
+    load_favorites, toggle_favorite, is_favorite, load_content_states, load_recently_played, load_continue_watching, add_recently_played, load_playback_progress, mark_watched, remove_from_history, clear_history, history_revision, load_settings, save_settings, save_tmdb_credential, update_api_keys, consume_recovery_notices)
 
 
 
@@ -238,13 +389,13 @@ def _grid_card_chrome_from_poster(source_path, selected=False):
     try:stamp=str(int(os.path.getmtime(source_path)))
     except Exception:stamp="0"
     variant="selected-clean" if selected else "normal"
-    key=hashlib.sha1((source_path+"|"+stamp+"|us-card-full-v7-focus-clean|"+variant).encode("utf-8","ignore")).hexdigest()
-    target=os.path.join(THUMB_CACHE_DIR,"cardfull_%s_250x382_v7_%s.png"%(key,variant))
+    key=hashlib.sha1((source_path+"|"+stamp+"|us-card-full-v8-small-206x382|"+variant).encode("utf-8","ignore")).hexdigest()
+    target=os.path.join(THUMB_CACHE_DIR,"cardfull_%s_206x382_v8_%s.png"%(key,variant))
     if os.path.isfile(target) and os.path.getsize(target)>100:return target
     try:
         primary,_secondary=_dynamic_palette(source_path)
         r,g,b=_lift_dynamic_accent(primary,0.48,0.46)
-        canvas=_PILImage.new("RGBA",(250,382),(0,0,0,0))
+        canvas=_PILImage.new("RGBA",(206,382),(0,0,0,0))
         # 3D adaptive information tray.  The poster ends exactly at footer_top;
         # the tray is a separate bevel/glass block like the Portal/Movie cards.
         # Overlap the last two poster pixels so there is never a black seam
@@ -256,26 +407,26 @@ def _grid_card_chrome_from_poster(source_path, selected=False):
             # brighter upper lip -> deep lower body -> subtle reflected bottom edge
             level=(0.58-0.31*t) if t < 0.76 else (0.29+0.13*(t-0.76)/0.24)
             rr=int(max(4,min(255,r*level)));gg=int(max(6,min(255,g*level)));bb=int(max(8,min(255,b*level)))
-            draw.line((3,yy,246,yy),fill=(rr,gg,bb,246))
+            draw.line((3,yy,202,yy),fill=(rr,gg,bb,246))
         # Seamless poster-to-info transition.  Do not draw a bright horizontal
         # top lip here: on the focused card it reads as an unwanted line running
         # through the inside of the adaptive frame.  Keep only subtle side/bottom
         # depth so the information tray still has volume without a separator.
         mid=(min(255,r+28),min(255,g+28),min(255,b+28),118)
-        draw.line((7,377,242,377),fill=(r//3,g//3,b//3,190),width=2)
+        draw.line((7,377,198,377),fill=(r//3,g//3,b//3,190),width=2)
         draw.line((5,footer_top+2,5,374),fill=mid,width=1)
-        draw.line((244,footer_top+2,244,374),fill=(max(3,r//5),max(3,g//5),max(3,b//5),185),width=1)
+        draw.line((200,footer_top+2,200,374),fill=(max(3,r//5),max(3,g//5),max(3,b//5),185),width=1)
         # The normal card keeps its adaptive frame.  The focused card deliberately
         # omits this layer because the separate 266x398 selection laser already
         # supplies the visible focus edge; drawing both creates the unwanted
         # second/inner line seen inside the laser.
         if not selected:
             laser=_PILImage.new("RGBA",canvas.size,(0,0,0,0));ld=ImageDraw.Draw(laser)
-            ld.rounded_rectangle((2,2,247,379),radius=15,outline=(r,g,b,128),width=3)
+            ld.rounded_rectangle((2,2,203,379),radius=15,outline=(r,g,b,128),width=3)
             if _PILImageFilter is not None:
                 laser=laser.filter(_PILImageFilter.GaussianBlur(3))
             canvas=_PILImage.alpha_composite(canvas,laser);draw=ImageDraw.Draw(canvas)
-            draw.rounded_rectangle((1,1,248,380),radius=15,outline=(min(255,r+18),min(255,g+18),min(255,b+18),236),width=2)
+            draw.rounded_rectangle((1,1,204,380),radius=15,outline=(min(255,r+18),min(255,g+18),min(255,b+18),236),width=2)
         _persistent_write_require(target);canvas.save(target,"PNG",optimize=True)
         return target
     except Exception as exc:
@@ -289,51 +440,53 @@ def _grid_card_chrome_cached(source_path, selected=False):
     try:stamp=str(int(os.path.getmtime(source_path)))
     except Exception:stamp="0"
     variant="selected-clean" if selected else "normal"
-    key=hashlib.sha1((source_path+"|"+stamp+"|us-card-full-v7-focus-clean|"+variant).encode("utf-8","ignore")).hexdigest()
-    target=os.path.join(THUMB_CACHE_DIR,"cardfull_%s_250x382_v7_%s.png"%(key,variant))
+    key=hashlib.sha1((source_path+"|"+stamp+"|us-card-full-v8-small-206x382|"+variant).encode("utf-8","ignore")).hexdigest()
+    target=os.path.join(THUMB_CACHE_DIR,"cardfull_%s_206x382_v8_%s.png"%(key,variant))
     return target if _valid_cache_file(target,ttl=0) else None
 
 
 def _grid_selection_asset_from_poster(source_path):
-    """Build a clearly visible adaptive laser focus around the complete card."""
+    """Build a thick adaptive laser focus around the complete card."""
     if not source_path or not os.path.isfile(source_path) or _PILImage is None or ImageDraw is None:
         return None
     try:stamp=str(int(os.path.getmtime(source_path)))
     except Exception:stamp="0"
-    key=hashlib.sha1((source_path+"|"+stamp+"|us-card-select-v8-no-reflection-arc").encode("utf-8","ignore")).hexdigest()
+    # Test72 restores the thick TV-visible selector, but keeps it fully outside
+    # the 206x382 card so the poster itself never shrinks and no inner frame is
+    # drawn over the artwork.
+    key=hashlib.sha1((source_path+"|"+stamp+"|us-card-select-v12-thickoutside-222x398").encode("utf-8","ignore")).hexdigest()
     cached=_GRID_ACCENT_CACHE.get(key)
     if cached and os.path.isfile(cached):
         try:_GRID_ACCENT_CACHE.move_to_end(key)
         except Exception as exc:optional_failure("ui.silent_guard",exc)
         return cached
-    target=os.path.join(THUMB_CACHE_DIR,"selcard_%s_266x398_v8.png"%key)
+    target=os.path.join(THUMB_CACHE_DIR,"selcard_%s_222x398_v12.png"%key)
     if os.path.isfile(target) and os.path.getsize(target)>100:
         _GRID_ACCENT_CACHE[key]=target;return target
     try:
         primary,_secondary=_dynamic_palette(source_path)
         r,g,b=_lift_dynamic_accent(primary,0.60,0.58)
-        canvas=_PILImage.new("RGBA",(266,398),(0,0,0,0))
+        canvas=_PILImage.new("RGBA",(222,398),(0,0,0,0))
 
-        # Strong TV-visible adaptive halo, kept outside the card artwork.
+        # Thick outer halo to hide the tiny square card/poster edge remnants the
+        # user highlighted, while staying outside the card footprint.
         glow=_PILImage.new("RGBA",canvas.size,(0,0,0,0));gd=ImageDraw.Draw(glow)
-        gd.rounded_rectangle((7,7,258,390),radius=21,outline=(r,g,b,250),width=11)
+        gd.rounded_rectangle((7,7,214,390),radius=18,outline=(r,g,b,248),width=11)
         if _PILImageFilter is not None:
             glow=glow.filter(_PILImageFilter.GaussianBlur(7))
         canvas=_PILImage.alpha_composite(canvas,glow)
 
-        # Tighter luminous halo reinforces the edge without drawing inside the poster.
+        # Secondary luminous band adds the strong thick look from the earlier
+        # build without introducing an inner rail across the poster/footer join.
         glow2=_PILImage.new("RGBA",canvas.size,(0,0,0,0));g2=ImageDraw.Draw(glow2)
-        g2.rounded_rectangle((8,8,257,389),radius=20,outline=(min(255,r+42),min(255,g+42),min(255,b+42),235),width=7)
+        g2.rounded_rectangle((8,8,213,389),radius=18,outline=(min(255,r+42),min(255,g+42),min(255,b+42),236),width=7)
         if _PILImageFilter is not None:
             glow2=glow2.filter(_PILImageFilter.GaussianBlur(3))
         canvas=_PILImage.alpha_composite(canvas,glow2)
 
         d=ImageDraw.Draw(canvas)
-        # Brighter, thicker razor-sharp outer laser core.
         core=(min(255,r+92),min(255,g+92),min(255,b+92),255)
-        d.rounded_rectangle((8,8,257,389),radius=20,outline=core,width=4)
-        # No inner rail: it could visually cross the poster/footer boundary and
-        # appear as the unwanted horizontal line seen while moving focus.
+        d.rounded_rectangle((8,8,213,389),radius=18,outline=core,width=4)
 
         _persistent_write_require(target);canvas.save(target,"PNG",optimize=True)
         _GRID_ACCENT_CACHE[key]=target
@@ -348,51 +501,54 @@ def _grid_selection_asset_from_poster(source_path):
 
 
 def _grid_page_mood_from_poster(source_path):
-    """Full-screen list-page atmosphere using the exact poster palette used by Details.
+    """Visible full-screen adaptive atmosphere from the selected HDD poster only.
 
-    No backdrop is sampled here.  The selected poster is the single colour authority,
-    so List -> Details keeps one stable adaptive identity.
+    Test66 keeps one cache key shared with GridArtworkMixin and raises the light
+    field slightly so the page itself remains visibly adaptive instead of looking
+    permanently black while only the top HUD frames change colour.
     """
     if not source_path or not os.path.isfile(source_path) or _PILImage is None:
         return None
-    try: stamp=str(int(os.path.getmtime(source_path)))
-    except Exception: stamp="0"
-    key=hashlib.sha1((source_path+"|"+stamp+"|grid-page-mood-v5-lowmem").encode("utf-8","ignore")).hexdigest()
-    target=os.path.join(THUMB_CACHE_DIR,"gridmood_%s_960x540_v5.jpg"%key)
-    if _valid_cache_file(target,ttl=0): return target
-    if not _persistent_write_ok(THUMB_CACHE_DIR): return None
+    try:
+        st=os.stat(source_path);stamp="%s|%s"%(int(getattr(st,"st_mtime_ns",int(st.st_mtime*1e9))),int(st.st_size))
+    except Exception:stamp="0|0"
+    key=hashlib.sha1((source_path+"|"+stamp+"|grid-page-mood-v8-stable").encode("utf-8","ignore")).hexdigest()
+    target=os.path.join(THUMB_CACHE_DIR,"gridmood_%s_960x540_v8_stable.jpg"%key)
+    if _valid_cache_file(target,ttl=0):return target
+    if not _persistent_write_ok(THUMB_CACHE_DIR):return None
     temp=target+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
     try:
         primary,secondary=_dynamic_palette(source_path)
-        w,h=960,540;base=(2,7,12)
-        # Build the colour field at tiny resolution then upscale.  This keeps
-        # focus changes cheap on the receiver while producing the same smooth
-        # adaptive light pool behind the cards.
+        def _lift(rgb,floor=82):
+            vals=[max(0,min(255,int(x))) for x in rgb[:3]]
+            peak=max(vals) if vals else 0
+            if peak<floor:
+                scale=float(floor)/float(max(1,peak))
+                vals=[min(255,int(v*scale)) for v in vals]
+            return tuple(vals)
+        primary=_lift(primary,86);secondary=_lift(secondary,72)
+        w,h=960,540;base=(5,10,18)
         lw,lh=120,68;small=_PILImage.new("RGB",(lw,lh),base);px=small.load()
         pr,pg,pb=primary;sr,sg,sb=secondary
         for y in range(lh):
             ny=y/float(max(1,lh-1))
             for x in range(lw):
-                nx=x/float(max(1,lw-1));dx=(nx-0.50)/0.62;dy=(ny-0.53)/0.58
+                nx=x/float(max(1,lw-1));dx=(nx-0.50)/0.66;dy=(ny-0.50)/0.64
                 radial=max(0.0,1.0-(dx*dx+dy*dy));edge=max(0.0,1.0-abs(nx-0.5)*2.0)
-                # Strong enough to be clearly visible on a TV, while retaining
-                # the dark cinema base.  Details uses the same _dynamic_palette().
-                a=0.84*radial*(0.98-0.24*ny);bmix=0.34*edge*(1.0-0.30*ny)
+                a=0.60*radial*(1.00-0.20*ny);bmix=0.22*edge*(1.0-0.24*ny)
                 rr=int(base[0]*(1-a-bmix)+pr*a+sr*bmix);gg=int(base[1]*(1-a-bmix)+pg*a+sg*bmix);bb=int(base[2]*(1-a-bmix)+pb*a+sb*bmix)
                 px[x,y]=(max(0,min(255,rr)),max(0,min(255,gg)),max(0,min(255,bb)))
         resampling=getattr(getattr(_PILImage,"Resampling",_PILImage),"BICUBIC",3);img=small.resize((w,h),resampling)
-        if _PILImageFilter is not None:img=img.filter(_PILImageFilter.GaussianBlur(12))
-        _persistent_write_require(temp);img.save(temp,"JPEG",quality=86,optimize=False,progressive=False)
+        if _PILImageFilter is not None:img=img.filter(_PILImageFilter.GaussianBlur(10))
+        _persistent_write_require(temp);img.save(temp,"JPEG",quality=88,optimize=False,progressive=False)
         _persistent_write_require(target);os.replace(temp,target)
         return target if _valid_cache_file(target,ttl=0) else None
     except Exception as exc:
         optional_failure("ui.grid_page_mood",exc)
         try:
-            if os.path.exists(temp) and _persistent_write_ok(temp): os.unlink(temp)
-        except Exception as exc: optional_failure("ui.silent_guard",exc)
+            if os.path.exists(temp) and _persistent_write_ok(temp):os.unlink(temp)
+        except Exception as cleanup_exc:optional_failure("ui.grid_page_mood_cleanup",cleanup_exc)
         return None
-
-
 
 
 def _looks_like_m3u_url(value):
@@ -513,7 +669,8 @@ def _active_theme():
             value = "nova_fhd"
         _ACTIVE_THEME_CACHE = value if value in THEMES else "nova_fhd"
         return _ACTIVE_THEME_CACHE
-from .persistent_cache import ROOT as PERSISTENT_CACHE_ROOT, PORTAL_ART as PERSISTENT_ART_DIR, BACKDROPS as BACKDROP_CACHE_DIR, GENERATED as PERSISTENT_GENERATED_DIR, hdd_ready, hdd_read_ready, ensure_persistent_dirs, persistent_write_gate, initialize_persistent_cache_once
+from .persistent_cache import ROOT as PERSISTENT_CACHE_ROOT, INDEX as PERSISTENT_LIBRARY_DIR, POSTERS as PERSISTENT_ART_DIR, BACKDROPS as BACKDROP_CACHE_DIR, GENERATED as PERSISTENT_GENERATED_DIR, ADAPTIVE as PERSISTENT_ADAPTIVE_DIR, SOURCE_POSTERS as SOURCE_POSTER_CACHE_DIR, SOURCE_BACKDROPS as SOURCE_BACKDROP_CACHE_DIR, HOME as PERSISTENT_HOME_DIR, LIVE as PERSISTENT_LIVE_DIR, hdd_ready, hdd_read_ready, ensure_persistent_dirs, persistent_write_gate, initialize_persistent_cache_once
+from .media_library import load as load_global_media, save as save_global_media, item_paths as global_media_paths
 
 def _select_artwork_cache_root():
     # Central HDD-first persistent cache selected once by persistent_cache.py.
@@ -524,201 +681,166 @@ IMAGE_CACHE_DIR = PERSISTENT_ART_DIR
 THUMB_CACHE_DIR = PERSISTENT_GENERATED_DIR
 CATEGORY_ADAPTIVE_TMP_DIR = os.path.join(PERSISTENT_GENERATED_DIR, "category_adaptive")
 HOME_RUNTIME_DIR = os.path.join(PERSISTENT_GENERATED_DIR, "home_runtime")
+HOME_SINGLE_DIR = PERSISTENT_HOME_DIR
 VISUAL_BUNDLE_DIR = os.path.join(PERSISTENT_GENERATED_DIR, "visual_bundles")
-CONTENT_ART_DIR = os.path.join(PERSISTENT_GENERATED_DIR, "content_art")
+# R171 durable final adaptive cache. Only final title chrome + its small pointer JSON live here.
+ADAPTIVE_CHROME_DIR = os.path.join(PERSISTENT_ADAPTIVE_DIR, "chrome")
+ADAPTIVE_BUNDLE_DIR = os.path.join(PERSISTENT_ADAPTIVE_DIR, "bundles")
+
 
 def _visual_bundle_legacy_path(profile, media_type, item):
+    # Beta54: no legacy visual-bundle identity. Derived UI state is keyed only
+    # by the verified global TMDB identity when available.
+    return _visual_bundle_path(profile,media_type,item,None)
+
+
+def _tmdb_identity_for_item(profile,media_type,item,snapshot=None):
+    """Return only an independently compatible external identity for originals.
+
+    Test65 hardens the visual path as well as metadata: a stale/search-derived
+    TMDB id must never select another title's global artwork/derived bundle.
+    """
+    snap=snapshot if isinstance(snapshot,dict) else {}
+    row=item if isinstance(item,dict) else {}
+
+    def candidate(source, provider_row=False):
+        if not isinstance(source,dict):return (None,None)
+        tid=source.get("tmdb_id") or source.get("tmdbid")
+        mt=source.get("media_type") or media_type
+        if not tid:return (None,None)
+        if not provider_row:
+            try:
+                if not identity_cache_compatible(row,source):return (None,None)
+            except Exception:return (None,None)
+        try:return ("tv" if str(mt).lower() in ("tv","series") else "movie",int(tid))
+        except Exception:return (None,None)
+
+    mt,tid=candidate(snap,False)
+    if tid:return mt,tid
+    # ``item`` here is the raw provider catalogue row on Details/Grid callers.
+    # A structured provider id is independent evidence and may anchor originals.
+    mt,tid=candidate(row,True)
+    if tid:return mt,tid
     try:
-        from .persistent_cache import content_cache_key
-        key=content_cache_key(profile,media_type,item)
-    except Exception:
-        key=hashlib.sha1(repr(item).encode("utf-8","ignore")).hexdigest()
-    return os.path.join(VISUAL_BUNDLE_DIR,"%s_%s.json"%(str(media_type or "vod"),key))
+        local=load_detail_snapshot(profile or {},media_type,row) or {}
+        mt,tid=candidate(local,False)
+        if tid:return mt,tid
+    except Exception:pass
+    return (None,None)
+
 
 def _visual_bundle_path(profile, media_type, item, snapshot=None):
-    try:key=canonical_external_digest(media_type,item,snapshot)
+    """Per-content derived presentation path.
+
+    Originals may still deduplicate globally by verified TMDB identity, but UI
+    derivatives must never be shared solely because several catalogue rows once
+    pointed at the same (possibly poisoned) external id.  The stable provider
+    content key also lets non-TMDB/manual BLUE artwork own Adaptive Details.
+    """
+    try:key=str(content_cache_key(profile or {},media_type,item or {}) or "")
     except Exception:key=""
-    if key:return os.path.join(VISUAL_BUNDLE_DIR,"canonical_%s.json"%key)
-    return _visual_bundle_legacy_path(profile,media_type,item)
+    if not key:return ""
+    return os.path.join(VISUAL_BUNDLE_DIR,"content_%s.json"%key)
 
-def _content_art_paths(profile, media_type, item):
-    """Stable HDD artwork owned by content identity, independent from source URL."""
+
+def _persistent_adaptive_bundle_path(profile, media_type, item):
+    try:key=str(content_cache_key(profile or {},media_type,item or {}) or "")
+    except Exception:key=""
+    if not key:return ""
+    return os.path.join(ADAPTIVE_BUNDLE_DIR,"content_%s.json"%key)
+
+
+def _load_persistent_adaptive_bundle(profile,media_type,item):
+    path=_persistent_adaptive_bundle_path(profile,media_type,item)
+    if not path or not hdd_read_ready():return {}
     try:
-        key=content_cache_key(profile or {},media_type,item or {})
-    except Exception:
-        key=""
-    if not key:return {}
-    root=os.path.join(CONTENT_ART_DIR,str(key))
-    return {
-        "dir":root,
-        "poster":os.path.join(root,"poster.jpg"),
-        "backdrop":os.path.join(root,"backdrop.jpg"),
-        "manifest":os.path.join(root,"manifest.json"),
-    }
-
-
-def _copy_content_art(source,target):
-    source=str(source or "");target=str(target or "")
-    if not source or not target or not os.path.isfile(source):
-        return ""
-    try:
-        if os.path.isfile(target) and os.path.getsize(target)>256:
-            return target
-    except Exception as exc:
-        optional_failure("ui.content_art_existing",exc)
-    temp=None
-    try:
-        os.makedirs(os.path.dirname(target),mode=0o700,exist_ok=True)
-        if not _persistent_write_ok(target):return ""
-        temp=target+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
-        _persistent_write_require(temp)
-        # Decode once and normalize to JPEG. This gives Enigma2 one predictable
-        # local format whether the provider supplied PNG/WebP/JPEG.
-        if _PILImage is not None:
-            with _PILImage.open(source) as im:
-                try:im=_PILImageOps.exif_transpose(im)
-                except Exception as exc:optional_failure("ui.content_art_exif",exc)
-                im=im.convert("RGB")
-                im.save(temp,"JPEG",quality=94,optimize=False,progressive=False)
-        else:
-            with open(source,"rb") as src, open(temp,"wb") as dst:
-                while True:
-                    chunk=src.read(256*1024)
-                    if not chunk:break
-                    dst.write(chunk)
-                dst.flush();os.fsync(dst.fileno())
-        _persistent_write_require(target);os.replace(temp,target);temp=None
-        return target if os.path.isfile(target) and os.path.getsize(target)>256 else ""
-    except Exception as exc:
-        optional_failure("ui.content_art_copy",exc)
-        return ""
-    finally:
-        if temp:
-            try:
-                if os.path.exists(temp) and _persistent_write_ok(temp):os.unlink(temp)
-            except OSError:pass
-
-
-_CONTENT_VISUAL_KEYS=("poster","backdrop","detail_poster","backdrop_present","grid_thumb","grid_card","grid_selection","grid_mood","theme","accent","edge")
-
-def _load_content_manifest(profile,media_type,item):
-    paths=_content_art_paths(profile,media_type,item)
-    if not paths or not hdd_read_ready():return {}
-    try:
-        with open(paths["manifest"],"r",encoding="utf-8") as fh:
-            data=json.load(fh)
+        with open(path,"r",encoding="utf-8") as fh:data=json.load(fh)
         if not isinstance(data,dict):return {}
-        out=dict(data)
-        for key in _CONTENT_VISUAL_KEYS:
-            value=str(out.get(key) or "")
-            if value and not os.path.isfile(value):out[key]=""
-        chrome=out.get("chrome")
-        if isinstance(chrome,dict):out["chrome"]={k:v for k,v in chrome.items() if v and os.path.isfile(str(v))}
-        else:out["chrome"]={}
-        # Hard persistent visual locks are derived from real HDD files, not from
-        # timestamps or a successful network session.  Once a component exists
-        # it is authoritative forever unless the user explicitly clears cache.
-        out["poster_final"]=bool(str(out.get("poster") or "") and os.path.isfile(str(out.get("poster") or "")))
-        out["detail_poster_final"]=bool(str(out.get("detail_poster") or "") and os.path.isfile(str(out.get("detail_poster") or "")))
-        out["backdrop_source_final"]=bool(str(out.get("backdrop") or "") and os.path.isfile(str(out.get("backdrop") or "")))
-        out["backdrop_final"]=bool(str(out.get("backdrop_present") or "") and os.path.isfile(str(out.get("backdrop_present") or "")))
-        out["grid_final"]=bool(str(out.get("grid_thumb") or "") and os.path.isfile(str(out.get("grid_thumb") or "")))
-        out["adaptive_final"]=bool(
-            out.get("poster_final") and str(out.get("theme") or "") and os.path.isfile(str(out.get("theme") or "")) and
-            str(out.get("accent") or "") and os.path.isfile(str(out.get("accent") or "")) and bool(out.get("chrome"))
-        )
-        out["hard_visual_lock"]=bool(out.get("poster_final") and out.get("grid_final") and out.get("backdrop_final") and out.get("adaptive_final"))
-        return out
+        chrome=data.get("chrome") if isinstance(data.get("chrome"),dict) else {}
+        chrome={k:v for k,v in chrome.items() if v and os.path.isfile(str(v))}
+        if not chrome:return {}
+        return {"chrome":chrome,"adaptive_source_fp":str(data.get("adaptive_source_fp") or "")}
     except Exception:
         return {}
 
-def _write_content_manifest(profile,media_type,item,updates,source="visual_bundle"):
-    paths=_content_art_paths(profile,media_type,item)
-    if not paths or not isinstance(updates,dict):return False
-    old=_load_content_manifest(profile,media_type,item) or {}
-    merged=dict(old);dirty=False
-    # Component-level hard lock: once a valid visual is recorded, no late
-    # callback/provider/TMDB result may replace it.  This is intentionally
-    # stronger than a normal cache and survives restart/power-off.
-    for key,value in updates.items():
-        if key in _CONTENT_VISUAL_KEYS:
-            existing=str(old.get(key) or "")
-            if existing and os.path.isfile(existing):
-                continue
-            value=str(value or "")
-            if value and os.path.isfile(value):
-                merged[key]=value;dirty=True
-        elif key=="chrome" and isinstance(value,dict):
-            current=old.get("chrome") if isinstance(old.get("chrome"),dict) else {}
-            if current and all(v and os.path.isfile(str(v)) for v in current.values()):
-                continue
-            clean={k:v for k,v in value.items() if v and os.path.isfile(str(v))}
-            if clean:
-                merged["chrome"]=clean;dirty=True
-        elif value not in (None,"",{},[]):
-            if old.get(key)!=value:
-                merged[key]=value;dirty=True
-    # Do not rewrite the manifest merely because an async callback repeated the
-    # same information.  Avoiding fsync storms is part of the hard-lock design.
-    if not dirty and old:
-        return True
-    merged["schema"]=3;merged["source"]=str(old.get("source") or source or "")
-    merged["updated_at"]=int(old.get("updated_at") or time.time())
-    merged["poster_ready"]=bool(str(merged.get("poster") or "") and os.path.isfile(str(merged.get("poster") or "")))
-    merged["backdrop_ready"]=bool(str(merged.get("backdrop") or "") and os.path.isfile(str(merged.get("backdrop") or "")))
-    merged["grid_ready"]=bool(str(merged.get("grid_thumb") or "") and os.path.isfile(str(merged.get("grid_thumb") or "")))
-    merged["adaptive_ready"]=bool((merged.get("chrome") or merged.get("grid_card") or merged.get("theme")) and merged.get("poster_ready"))
-    merged["details_adaptive_ready"]=bool(merged.get("theme") and merged.get("accent") and merged.get("chrome") and merged.get("poster_ready"))
-    merged["poster_final"]=merged["poster_ready"]
-    merged["detail_poster_final"]=bool(str(merged.get("detail_poster") or "") and os.path.isfile(str(merged.get("detail_poster") or "")))
-    merged["backdrop_source_final"]=merged["backdrop_ready"]
-    merged["backdrop_final"]=bool(str(merged.get("backdrop_present") or "") and os.path.isfile(str(merged.get("backdrop_present") or "")))
-    merged["grid_final"]=merged["grid_ready"]
-    merged["adaptive_final"]=bool(merged.get("details_adaptive_ready"))
-    merged["hard_visual_lock"]=bool(merged.get("poster_final") and merged.get("grid_final") and merged.get("backdrop_final") and merged.get("adaptive_final"))
-    tmp=paths["manifest"]+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
+
+def _save_persistent_adaptive_bundle(profile,media_type,item,chrome,source_fp):
+    if not isinstance(chrome,dict) or not chrome or not source_fp:return False
+    path=_persistent_adaptive_bundle_path(profile,media_type,item)
+    if not path:return False
     try:
-        if not _persistent_write_ok(paths["manifest"]):return False
-        os.makedirs(paths["dir"],mode=0o700,exist_ok=True)
-        _persistent_write_require(tmp)
-        with open(tmp,"w",encoding="utf-8") as fh:
-            json.dump(merged,fh,ensure_ascii=False,separators=(",",":"));fh.flush();os.fsync(fh.fileno())
-        _persistent_write_require(paths["manifest"]);os.replace(tmp,paths["manifest"])
+        if not _persistent_write_ok(ADAPTIVE_BUNDLE_DIR):return False
+        os.makedirs(ADAPTIVE_BUNDLE_DIR,mode=0o700,exist_ok=True)
+        clean={k:str(v) for k,v in chrome.items() if v and os.path.isfile(str(v))}
+        if not clean:return False
+        payload={"schema":171,"chrome":clean,"adaptive_source_fp":str(source_fp),"updated_at":int(time.time())}
+        temp=path+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
+        _persistent_write_require(temp)
+        with open(temp,"w",encoding="utf-8") as fh:
+            json.dump(payload,fh,ensure_ascii=False,separators=(",",":"));fh.flush();os.fsync(fh.fileno())
+        _persistent_write_require(path);os.replace(temp,path)
         return True
     except Exception as exc:
-        optional_failure("ui.content_art_manifest",exc)
+        optional_failure("ui.persistent_adaptive_save",exc)
         try:
-            if os.path.exists(tmp) and _persistent_write_ok(tmp):os.unlink(tmp)
-        except Exception as cleanup_exc:optional_failure("ui.content_art_manifest_cleanup",cleanup_exc)
+            if 'temp' in locals() and os.path.exists(temp):os.unlink(temp)
+        except Exception:pass
         return False
 
-def _promote_content_art(profile,media_type,item,poster=None,backdrop=None,source="provider"):
-    """Promote artwork once into immutable content-owned HDD files."""
-    paths=_content_art_paths(profile,media_type,item)
-    if not paths:return {}
+
+def _content_art_paths(profile, media_type, item):
+    """Compatibility wrapper onto the ONE global TMDB library.
+
+    No per-portal artwork directory exists anymore.
+    """
+    mt,tid=_tmdb_identity_for_item(profile,media_type,item,None)
+    if not tid:return {}
+    paths=global_media_paths(mt,tid)
+    return {"dir":paths["dir"],"poster":paths["poster"],"backdrop":paths["backdrop"],"manifest":paths["metadata"]}
+
+
+def _load_content_manifest(profile,media_type,item):
+    mt,tid=_tmdb_identity_for_item(profile,media_type,item,None)
+    if not tid:return {}
+    row=load_global_media(mt,tid) or {}
+    if row.get("poster_local"):row["poster"]=row.get("poster_local")
+    if row.get("backdrop_local"):row["backdrop"]=row.get("backdrop_local")
+    return row
+
+
+def _write_content_manifest(profile,media_type,item,updates,source="visual_bundle"):
+    # Original artwork/metadata may only be written by media_library/ArtworkV2.
+    # This compatibility hook persists metadata fields only when a verified TMDB
+    # identity already exists; derived chrome is never copied into library/.
+    mt,tid=_tmdb_identity_for_item(profile,media_type,item,updates if isinstance(updates,dict) else None)
+    if not tid:return False
+    safe={k:v for k,v in (updates or {}).items() if k not in ("grid_thumb","grid_card","grid_selection","grid_mood","detail_poster","backdrop_present","theme","accent","edge","chrome","poster","backdrop")}
+    return save_global_media(mt,tid,safe) if safe else True
+
+
+def _promote_content_art(profile,media_type,item,poster=None,backdrop=None,source="tmdb-library"):
+    # Beta54 hard rule: never duplicate/copy original poster/backdrop outside the
+    # global TMDB library. Callers receive the already-owned library paths only.
+    row=_load_content_manifest(profile,media_type,item)
     out={}
-    p=_copy_content_art(poster,paths["poster"]) if poster else (paths["poster"] if os.path.isfile(paths["poster"]) else "")
-    b=_copy_content_art(backdrop,paths["backdrop"]) if backdrop else (paths["backdrop"] if os.path.isfile(paths["backdrop"]) else "")
-    if p:out["poster"]=p
-    if b:out["backdrop"]=b
-    if out:_write_content_manifest(profile,media_type,item,out,source=source)
+    if row.get("poster_local"):out["poster"]=row.get("poster_local")
+    if row.get("backdrop_local"):out["backdrop"]=row.get("backdrop_local")
     return out
 
 
 def _load_content_art(profile,media_type,item):
-    paths=_content_art_paths(profile,media_type,item)
-    if not paths:return {}
-    out=_load_content_manifest(profile,media_type,item) or {}
-    try:
-        p=paths["poster"]
-        if os.path.isfile(p) and os.path.getsize(p)>256:out["poster"]=p
-    except Exception as exc:optional_failure("ui.content_art_poster_read",exc)
-    try:
-        b=paths["backdrop"]
-        if os.path.isfile(b) and os.path.getsize(b)>256:out["backdrop"]=b
-    except Exception as exc:optional_failure("ui.content_art_backdrop_read",exc)
-    return out
+    return _load_content_manifest(profile,media_type,item)
 
+
+
+def _visual_source_fingerprint(path):
+    """Cheap binding for reproducible derivatives to their global source."""
+    try:
+        path=os.path.realpath(str(path or ""))
+        if not path or not os.path.isfile(path):return ""
+        st=os.stat(path)
+        return hashlib.sha1((path+"|%s|%s"%(int(st.st_mtime_ns),int(st.st_size))).encode("utf-8","ignore")).hexdigest()
+    except Exception:return ""
 
 def _validate_visual_bundle(data):
     if not isinstance(data,dict):return {}
@@ -732,76 +854,109 @@ def _validate_visual_bundle(data):
     return data
 
 def _load_visual_bundle(profile, media_type, item, snapshot=None):
-    """Load only artwork whose persistence identity is safe for this item."""
-    snap=snapshot if isinstance(snapshot,dict) else {}
-    owned=_load_content_art(profile,media_type,item)
-    if snap.get("_identity_stale"):
-        return {}
-    if snap.get("tmdb_id") and not identity_cache_compatible(item,snap):
-        return {}
-    if not hdd_read_ready():return {}
-    # A fully sealed content-owned visual state needs no canonical/legacy JSON
-    # lookup at all.  HDD content manifest is the source of truth.
-    if owned.get("hard_visual_lock"):
-        return dict(owned)
-    canonical=_visual_bundle_path(profile,media_type,item,snap)
-    legacy=_visual_bundle_legacy_path(profile,media_type,item)
+    """Return verified originals plus per-content reproducible UI derivatives.
 
-    # Once an external identity is verified, an old per-item bundle has no
-    # identity evidence and must not be migrated into that canonical identity.
-    # This is what allowed historical Pure provider art to overwrite a correct
-    # TMDB poster after leaving and revisiting a page.
-    verified_external=bool(
-        snap.get("identity_verified") and
-        str(snap.get("identity_source") or "") not in ("","portal_payload") and
-        (snap.get("tmdb_id") or snap.get("imdb_id"))
-    )
-    paths=(canonical,) if (verified_external and canonical!=legacy) else (canonical,legacy)
-    for path in paths:
+    Test65 isolates every presentation bundle by stable provider content key and
+    binds each derivative to the exact original file that produced it.  A stale
+    TMDB pointer can therefore never make unrelated titles share a poster,
+    backdrop presentation, gradient or adaptive chrome.
+    """
+    if not hdd_read_ready():return {}
+    mt,tid=_tmdb_identity_for_item(profile,media_type,item,snapshot)
+    global_row=load_global_media(mt,tid) if tid else {}
+    data={}
+    if global_row.get("poster_local"):data["poster"]=global_row.get("poster_local")
+    if global_row.get("backdrop_local"):data["backdrop"]=global_row.get("backdrop_local")
+    path=_visual_bundle_path(profile,media_type,item,snapshot)
+    if path:
         try:
-            with open(path,"r",encoding="utf-8") as fh:data=_validate_visual_bundle(json.load(fh))
-            if data:
-                if path==legacy and canonical!=legacy and not verified_external:
-                    try:_save_visual_bundle(profile,media_type,item,data,snapshot=snap)
-                    except Exception as exc:optional_failure("ui.silent_guard",exc)
-                # Content-owned final visuals always win over canonical/legacy
-                # bundles. Once recorded they are immutable across revisits.
-                for key in _CONTENT_VISUAL_KEYS:
-                    value=owned.get(key)
-                    if value:data[key]=value
-                if isinstance(owned.get("chrome"),dict) and owned.get("chrome"):
-                    data["chrome"]=dict(owned.get("chrome") or {})
-                for flag in ("poster_ready","backdrop_ready","grid_ready","adaptive_ready","details_adaptive_ready"):
-                    if flag in owned:data[flag]=bool(owned.get(flag))
-                return data
-        except Exception as exc:optional_failure("ui.silent_guard",exc)
-    return dict(owned) if owned else {}
+            with open(path,"r",encoding="utf-8") as fh:derived=_validate_visual_bundle(json.load(fh))
+            if isinstance(derived,dict):data.update(derived)
+        except Exception as exc:optional_failure("ui.visual_bundle_load",exc)
+    # R171: durable final adaptive overlays session presentation state. The
+    # source fingerprint check below still invalidates it if the poster changes.
+    try:
+        persistent_adaptive=_load_persistent_adaptive_bundle(profile,media_type,item)
+        if persistent_adaptive:data.update(persistent_adaptive)
+    except Exception as exc:optional_failure("ui.persistent_adaptive_load",exc)
+    # Reassert verified originals, then explicit BLUE per-content locks.
+    if global_row.get("poster_local"):data["poster"]=global_row.get("poster_local")
+    if global_row.get("backdrop_local"):data["backdrop"]=global_row.get("backdrop_local")
+    try:
+        manual=load_manual_rescue_art(profile,media_type,item) or {}
+        mp=str(manual.get("poster_local") or "");mb=str(manual.get("backdrop_local") or "")
+        # Provider/BLUE rescue is missing-only.  Never let an older fallback
+        # shadow a verified TMDB master that already exists in the global store.
+        if mp and os.path.isfile(mp) and not (data.get("poster") and os.path.isfile(str(data.get("poster")))):
+            data["poster"]=mp;data["manual_rescue_poster_locked"]=True
+        if mb and os.path.isfile(mb) and not (data.get("backdrop") and os.path.isfile(str(data.get("backdrop")))):
+            data["backdrop"]=mb;data["manual_rescue_backdrop_locked"]=True
+        if manual.get("manual_rescue_source"):data["manual_rescue_source"]=manual.get("manual_rescue_source")
+    except Exception as exc:optional_failure("ui.manual_rescue_bundle_load",exc)
+
+    poster_fp=_visual_source_fingerprint(data.get("poster") or global_row.get("poster_local"))
+    backdrop_fp=_visual_source_fingerprint(data.get("backdrop") or global_row.get("backdrop_local"))
+
+    # Poster-derived presentation is valid only for the exact poster bytes.
+    if data.get("detail_poster") and (not poster_fp or str(data.get("detail_poster_source_fp") or "")!=poster_fp):
+        data["detail_poster"]="";data.pop("detail_poster_source_fp",None)
+
+    # Integrated landscape must follow synthetic->real backdrop upgrades and can
+    # never survive a source change in place at manual_rescue_art/backdrop.jpg.
+    if data.get("backdrop_present") and (not backdrop_fp or str(data.get("backdrop_present_source_fp") or "")!=backdrop_fp):
+        data["backdrop_present"]="";data.pop("backdrop_present_source_fp",None)
+
+    # Adaptive chrome/gradient are poster-derived.  Fail closed when the source
+    # poster changed, which also kills old Test61-64 shared-TMDB contamination.
+    adaptive_keys=("theme","accent","edge")
+    has_adaptive=bool(any(data.get(k) for k in adaptive_keys) or (isinstance(data.get("chrome"),dict) and data.get("chrome")))
+    if has_adaptive and (not poster_fp or str(data.get("adaptive_source_fp") or "")!=poster_fp):
+        for k in adaptive_keys:data[k]=""
+        data["chrome"]={};data.pop("adaptive_source_fp",None)
+
+    # Test66: every Grid derivative is poster-derived too.  Test61-65 did not
+    # bind grid_thumb/card/selection/mood to the source bytes, so one poisoned
+    # English poster could keep reappearing after the original identity was fixed.
+    grid_keys=("grid_thumb","grid_card","grid_selection","grid_mood")
+    has_grid=any(data.get(k) for k in grid_keys)
+    if has_grid and (not poster_fp or str(data.get("grid_source_fp") or "")!=poster_fp):
+        for k in grid_keys:data[k]=""
+        data.pop("grid_source_fp",None)
+    return data
+
 
 def _save_visual_bundle(profile, media_type, item, payload, snapshot=None):
     if not isinstance(payload,dict) or not payload:return False
-    payload=dict(payload)
-    try:
-        promoted=_promote_content_art(
-            profile,media_type,item,
-            poster=payload.get("poster"),
-            backdrop=payload.get("backdrop"),
-            source=payload.get("source") or payload.get("identity_source") or "visual_bundle",
-        )
-        if promoted.get("poster"):payload["poster"]=promoted["poster"]
-        if promoted.get("backdrop"):payload["backdrop"]=promoted["backdrop"]
-    except Exception as exc:optional_failure("ui.visual_bundle_promote",exc)
-    # Persist final derivatives in the content-owned manifest as well.  This
-    # makes the first successful visual state authoritative even if a later
-    # canonical identity path or async callback changes.
-    try:
-        _write_content_manifest(profile,media_type,item,payload,source=payload.get("source") or payload.get("identity_source") or "visual_bundle")
-        owned=_load_content_manifest(profile,media_type,item) or {}
-        for key in _CONTENT_VISUAL_KEYS:
-            if owned.get(key):payload[key]=owned.get(key)
-        if isinstance(owned.get("chrome"),dict) and owned.get("chrome"):
-            payload["chrome"]=dict(owned.get("chrome") or {})
-    except Exception as exc:optional_failure("ui.visual_bundle_content_manifest",exc)
-    path=_visual_bundle_path(profile,media_type,item,snapshot)
+    path=_visual_bundle_path(profile,media_type,item,snapshot or payload)
+    if not path:return False
+    # Only reproducible presentation derivatives live here.  Test65 adds source
+    # fingerprints so in-place BLUE artwork upgrades invalidate stale UI assets.
+    allowed=("detail_poster","backdrop_present","grid_thumb","grid_card","grid_selection","grid_mood","theme","accent","edge","chrome","detail_poster_source_fp","backdrop_present_source_fp","adaptive_source_fp","grid_source_fp")
+    clean={k:v for k,v in payload.items() if k in allowed and v not in (None,"",{},[])}
+
+    mt,tid=_tmdb_identity_for_item(profile,media_type,item,snapshot or payload)
+    global_row=load_global_media(mt,tid) if tid else {}
+    manual={}
+    try:manual=load_manual_rescue_art(profile,media_type,item) or {}
+    except Exception:manual={}
+    poster_source=str(payload.get("poster") or manual.get("poster_local") or global_row.get("poster_local") or "")
+    backdrop_source=str(payload.get("backdrop") or manual.get("backdrop_local") or global_row.get("backdrop_local") or "")
+    poster_fp=_visual_source_fingerprint(poster_source)
+    backdrop_fp=_visual_source_fingerprint(backdrop_source)
+
+    if payload.get("detail_poster") and poster_fp:clean["detail_poster_source_fp"]=poster_fp
+    if payload.get("backdrop_present") and backdrop_fp:clean["backdrop_present_source_fp"]=backdrop_fp
+    if (payload.get("theme") or payload.get("accent") or payload.get("edge") or payload.get("chrome")) and poster_fp:
+        clean["adaptive_source_fp"]=poster_fp
+    # R171: final Details-family chrome is a durable part of the title package.
+    # Save it independently from the session visual bundle so restart/power-off
+    # never forces the same poster palette to be generated again.
+    if payload.get("chrome") and poster_fp:
+        if not _save_persistent_adaptive_bundle(profile,media_type,item,payload.get("chrome"),poster_fp):
+            return False
+    if any(payload.get(k) for k in ("grid_thumb","grid_card","grid_selection","grid_mood")) and poster_fp:
+        clean["grid_source_fp"]=poster_fp
+    if not clean:return True
     try:
         if not _persistent_write_ok(VISUAL_BUNDLE_DIR):return False
         os.makedirs(VISUAL_BUNDLE_DIR,mode=0o700,exist_ok=True)
@@ -810,20 +965,15 @@ def _save_visual_bundle(profile, media_type, item, payload, snapshot=None):
             if os.path.isfile(path):
                 with open(path,"r",encoding="utf-8") as fh:old=_validate_visual_bundle(json.load(fh))
         except Exception:old={}
-        merged=dict(old);merged.update({k:v for k,v in payload.items() if v not in (None,"",{},[])})
-        merged["schema"]=1;merged["updated_at"]=int(time.time())
-        temp=path+".tmp.%d"%os.getpid()
+        merged=dict(old);merged.update(clean);merged["schema"]=66;merged["updated_at"]=int(time.time())
+        temp=path+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
         _persistent_write_require(temp)
         with open(temp,"w",encoding="utf-8") as fh:
             json.dump(merged,fh,ensure_ascii=False,separators=(",",":"));fh.flush();os.fsync(fh.fileno())
-        _persistent_write_require(path);os.replace(temp,path)
-        return True
+        _persistent_write_require(path);os.replace(temp,path);return True
     except Exception as exc:
-        optional_failure("ui.visual_bundle_save",exc)
-        try:
-            if os.path.exists(temp) and _persistent_write_ok(temp):os.unlink(temp)
-        except Exception as exc:optional_failure("ui.silent_guard",exc)
-        return False
+        optional_failure("ui.visual_bundle_save",exc);return False
+
 
 def _persistent_write_ok(target):
     """Central UI gate for every mutation under Ultra Stalker's HDD cache."""
@@ -858,25 +1008,131 @@ def _fsync_parent_dir(path):
     except OSError:
         pass
 WIZARD_DONE_FILE = "/etc/enigma2/ultrastalker/.wizard_done"
-HOME_HERO_FILE = "/etc/enigma2/ultrastalker/home_hero.json"
-HOME_HERO_TTL = 7 * 24 * 60 * 60
-HOME_HERO_SCHEMA = 228
+HOME_HERO_FILE = os.path.join(HOME_SINGLE_DIR, "hero.json")
+HOME_HERO_TTL = 0
+HOME_HERO_SCHEMA = 303
+HERO_SINGLE_SLOT_MIGRATION = "/etc/enigma2/ultrastalker/.single_hero_slot_v303"
+_LEGACY_HERO_CLEANED = False
+
+
+def _prepare_single_home_hero(source_path,target_path,size=(1920,1080)):
+    # Exact release Home-Hero visual contract, adapted only to the current single slot.
+    try: os.makedirs(os.path.dirname(target_path) or HOME_SINGLE_DIR, exist_ok=True)
+    except Exception: return None
+    if _PILImage is None or not source_path or not os.path.isfile(source_path):return None
+    temp=target_path+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
+    try:
+        tw,th=map(int,size);rs=getattr(getattr(_PILImage,"Resampling",_PILImage),"LANCZOS",1)
+        with _PILImage.open(source_path) as image:
+            try:image=_PILImageOps.exif_transpose(image)
+            except Exception as exc:optional_failure("ui.silent_guard",exc)
+            image=image.convert("RGB")
+            if float(image.width)/max(1.0,float(image.height))<1.35:return None
+            scale=max(float(tw)/max(1,image.width),float(th)/max(1,image.height))
+            nw=max(tw,int(round(image.width*scale)));nh=max(th,int(round(image.height*scale)))
+            image=image.resize((nw,nh),rs)
+            left=max(0,(nw-tw)//2);top=max(0,(nh-th)//2)
+            image=image.crop((left,top,left+tw,top+th))
+            grade=_PILImage.new("RGBA",(tw,th),(2,7,12,38))
+            image=_PILImage.alpha_composite(image.convert("RGBA"),grade).convert("RGB")
+            scrim=_PILImage.new("RGBA",(tw,th),(0,0,0,0));sd=ImageDraw.Draw(scrim) if ImageDraw is not None else None
+            if sd is not None:
+                for x in range(0,min(tw,1040),16):
+                    q=x/1040.0;a=int(118*((1.0-q)**1.55))
+                    sd.rectangle((x,0,min(tw,x+16),470),fill=(1,6,10,a))
+            if _PILImageFilter is not None:
+                try:scrim=scrim.filter(_PILImageFilter.GaussianBlur(radius=22))
+                except Exception as exc:optional_failure("ui.silent_guard",exc)
+            image=_PILImage.alpha_composite(image.convert("RGBA"),scrim).convert("RGB")
+            vm=_PILImage.new("L",(1,th));vvals=[];fade_start=330.0;fade_end=610.0
+            for y in range(th):
+                if y<=fade_start:a=255
+                elif y>=fade_end:a=0
+                else:
+                    t=(y-fade_start)/(fade_end-fade_start);smooth=t*t*(3.0-2.0*t);a=int(255*(1.0-smooth))
+                vvals.append(max(0,min(255,a)))
+            vm.putdata(vvals);vm=vm.resize((tw,th))
+            hm=_PILImage.new("L",(tw,1));hvals=[]
+            for x in range(tw):
+                a=255
+                if x<70:
+                    t=x/70.0;a=int(224+31*t)
+                elif x>1870:
+                    t=max(0.0,(tw-1-x)/49.0);a=int(224+31*t)
+                hvals.append(max(0,min(255,a)))
+            hm.putdata(hvals);hm=hm.resize((tw,th))
+            alpha=_PILImageChops.multiply(hm,vm) if _PILImageChops is not None else vm
+            if _PILImageFilter is not None:
+                try:alpha=alpha.filter(_PILImageFilter.GaussianBlur(radius=12))
+                except Exception as exc:optional_failure("ui.silent_guard",exc)
+            rgba=image.convert("RGBA");rgba.putalpha(alpha);rgba.save(temp,"PNG",optimize=False)
+        os.replace(temp,target_path)
+        return target_path if os.path.isfile(target_path) and os.path.getsize(target_path)>100 else None
+    except Exception as exc:
+        optional_failure("ui.single_home_hero_prepare",exc)
+        try:
+            if os.path.exists(temp):os.unlink(temp)
+        except OSError:pass
+        return None
+
+def _cleanup_legacy_home_hero_storage():
+    """One-time cleanup of every old/automatic Home-Hero store.
+
+    After migration, ROOT/hero is single-slot only: one hero image plus hero.json.
+    Canonical movie/series poster and backdrop caches are never removed.
+    """
+    global _LEGACY_HERO_CLEANED
+    if _LEGACY_HERO_CLEANED:return True
+    try:
+        if not hdd_ready(force=True):return False
+        if not os.path.isfile(HERO_SINGLE_SLOT_MIGRATION):
+            for legacy_dir in (os.path.join(PERSISTENT_CACHE_ROOT,"home"),HOME_RUNTIME_DIR,HOME_SINGLE_DIR):
+                try:
+                    if legacy_dir and os.path.isdir(legacy_dir):shutil.rmtree(legacy_dir)
+                except Exception as exc:optional_failure("ui.hero_legacy_dir_cleanup",exc)
+            try:
+                if BACKDROP_CACHE_DIR and os.path.isdir(BACKDROP_CACHE_DIR):
+                    for name in os.listdir(BACKDROP_CACHE_DIR):
+                        if "homehero" not in name.lower():continue
+                        path=os.path.join(BACKDROP_CACHE_DIR,name)
+                        try:
+                            if os.path.isfile(path) or os.path.islink(path):os.unlink(path)
+                        except OSError:pass
+            except Exception as exc:optional_failure("ui.hero_legacy_tag_cleanup",exc)
+            os.makedirs(os.path.dirname(HERO_SINGLE_SLOT_MIGRATION),mode=0o700,exist_ok=True)
+            fd,tmp=tempfile.mkstemp(prefix=".hero-migrate.",dir=os.path.dirname(HERO_SINGLE_SLOT_MIGRATION))
+            try:
+                with os.fdopen(fd,"w",encoding="ascii") as fh:fh.write("single-slot-v303\n")
+                os.replace(tmp,HERO_SINGLE_SLOT_MIGRATION)
+            finally:
+                if os.path.exists(tmp):
+                    try:os.unlink(tmp)
+                    except OSError:pass
+        os.makedirs(HOME_SINGLE_DIR,mode=0o700,exist_ok=True)
+        _LEGACY_HERO_CLEANED=True
+        return True
+    except Exception as exc:
+        optional_failure("ui.hero_legacy_cleanup",exc);return False
+
 _PLUGIN_LAUNCH_SERIAL = 0
 _PLUGIN_LAUNCH_TOKEN = "%d-%d" % (os.getpid(), int(time.time() * 1000))
 _PLUGIN_ORIGINAL_SERVICE = None
+_PLUGIN_ORIGINAL_ASPECT_RATIO = None
 _PLUGIN_SERVICE_CAPTURED = False
 _RUNTIME_LOG_LOCK = threading.RLock()
+
 _RUNTIME_LOG_MAX = 1024 * 1024
 
 def _runtime_endurance_log(event, **fields):
     runtime_breadcrumb(event, **fields)
 
 def begin_plugin_launch(session=None):
-    global _PLUGIN_LAUNCH_SERIAL, _PLUGIN_LAUNCH_TOKEN, _PLUGIN_ORIGINAL_SERVICE, _PLUGIN_SERVICE_CAPTURED
+    global _PLUGIN_LAUNCH_SERIAL, _PLUGIN_LAUNCH_TOKEN, _PLUGIN_ORIGINAL_SERVICE, _PLUGIN_ORIGINAL_ASPECT_RATIO, _PLUGIN_SERVICE_CAPTURED
     _PLUGIN_LAUNCH_SERIAL += 1
     # Capture once at the true plugin boundary, before Splash/Wizard/PortalList
     # can change navigation state. This covers both normal and first-run flows.
     _PLUGIN_ORIGINAL_SERVICE = None
+    _PLUGIN_ORIGINAL_ASPECT_RATIO = capture_aspect_mode()
     _PLUGIN_SERVICE_CAPTURED = False
     if session is not None:
         try:
@@ -885,6 +1141,10 @@ def begin_plugin_launch(session=None):
         except Exception as exc:
             optional_failure("ui.launch_service_snapshot", exc)
     _PLUGIN_LAUNCH_TOKEN = "%d-%d-%d" % (os.getpid(), int(time.time() * 1000), _PLUGIN_LAUNCH_SERIAL)
+    # First launch action: eradicate legacy automatic/multi-Hero storage before
+    # any screen can read it.  This is a one-time in-process migration.
+    try:_cleanup_legacy_home_hero_storage()
+    except Exception as exc:optional_failure("ui.hero_legacy_cleanup_launch",exc)
     # Grid position belongs to one plugin session only.  Never carry page/index
     # across a full close/reopen in the same Enigma2 process.  This also avoids
     # rebuilding several old portal pages during the splash on the next launch.
@@ -914,29 +1174,40 @@ def _plugin_original_service_string():
         return ""
 
 def restore_plugin_service(session):
-    """Restore the pre-Ultra-Stalker service exactly at the full plugin exit.
+    """Return the receiver to the service and AV mode captured at plugin entry.
 
-    Child player exits stay silent. Only the outer plugin boundary calls this.
-    The operation is idempotent so PortalList and Splash safety nets may both
-    invoke it without replaying the service repeatedly.
+    Only the outer Ultra Stalker boundary owns this restoration.  Captured state
+    is consumed before touching Enigma2 so repeated safety-net calls are harmless.
     """
-    global _PLUGIN_ORIGINAL_SERVICE, _PLUGIN_SERVICE_CAPTURED
+    global _PLUGIN_ORIGINAL_SERVICE, _PLUGIN_ORIGINAL_ASPECT_RATIO, _PLUGIN_SERVICE_CAPTURED
     if not _PLUGIN_SERVICE_CAPTURED:
         return False
-    ref = _PLUGIN_ORIGINAL_SERVICE
-    _PLUGIN_SERVICE_CAPTURED = False
-    _PLUGIN_ORIGINAL_SERVICE = None
-    if session is None or ref is None:
+
+    return_ref=_PLUGIN_ORIGINAL_SERVICE
+    return_aspect=_PLUGIN_ORIGINAL_ASPECT_RATIO
+    _PLUGIN_SERVICE_CAPTURED=False
+    _PLUGIN_ORIGINAL_SERVICE=None
+    _PLUGIN_ORIGINAL_ASPECT_RATIO=None
+
+    if session is None or return_ref is None:
         return False
+    nav=getattr(session,"nav",None)
+    if nav is None:
+        return False
+
     try:
-        # At full exit, guarantee no Ultra Stalker native service survives.
-        try: force_session_silence(session, "", force=False, stop_native=True)
-        except Exception as exc: optional_failure("ui.exit_silence", exc)
-        session.nav.playService(ref)
-        return True
+        force_session_silence(session,"",force=False,stop_native=True)
     except Exception as exc:
-        optional_failure("ui.restore_original_service", exc)
+        optional_failure("ui.exit_silence",exc)
+
+    try:
+        nav.playService(return_ref)
+    except Exception as exc:
+        optional_failure("ui.restore_original_service",exc)
         return False
+
+    restore_aspect_mode(return_aspect)
+    return True
 
 IMAGE_CACHE_TTL = None
 ARTWORK_FAILURE_TTL = 30 * 60
@@ -1082,50 +1353,453 @@ def _live_restart_trace(event, **state):
         diagnostic_failure("ui.failsoft.image_meta_write",exc)
 
 
-_IMAGE_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-img")
-# us198: keep palette/chrome generation off the TMDB/backdrop network lane.
-# A cached poster can now recolour the details screen immediately while the
-# slower full metadata/backdrop request continues independently.
-_ADAPTIVE_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-adaptive")
-_BACKDROP_PRESENT_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-backdrop-present")
-_DETAIL_PREFETCH_EXECUTOR = LazyThreadPoolExecutor(max_workers=4, thread_name_prefix="ultrastalker-artwork")
-_FAST_POSTER_EXECUTOR = LazyThreadPoolExecutor(max_workers=8, thread_name_prefix="ultrastalker-poster-fast")
-_POSTER_RESCUE_EXECUTOR = LazyThreadPoolExecutor(max_workers=4, thread_name_prefix="ultrastalker-poster-rescue")
-_QUALITY_PREFETCH_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-quality")
-_GRID_EPG_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-grid-epg")
-_GRID_ACCENT_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-grid-accent")
-_POSTER_THUMB_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-poster-thumb")
-_CATEGORY_PREFETCH_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-categories")
+# Beta60: one derived-image executor plus a process-wide Pillow budget.
+# Different UI subsystems may request image work independently, but only one
+# heavy derived-image job is allowed to execute at a time on the receiver.
+_IMAGE_WORK_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-image-work")
+_IMAGE_EXECUTOR = _IMAGE_WORK_EXECUTOR
+_ADAPTIVE_EXECUTOR = _IMAGE_WORK_EXECUTOR
+_BACKDROP_PRESENT_EXECUTOR = _IMAGE_WORK_EXECUTOR
+# Test67: visible provider posters are first-paint UI assets, not rescue.
+# Keep them off the single Pillow lane so a 14-card page does not serialize
+# network waits behind thumbnail/chrome work. BLUE/TMDB rescue remains capped
+# by the separate two-worker global hydration executor below.
+_VISIBLE_PROVIDER_POSTER_EXECUTOR = VISIBLE_PROVIDER_ARTWORK_EXECUTOR
+# Page mood must not starve behind poster thumbnail/card generation.
+_GRID_MOOD_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-grid-mood")
+# Beta54: one global TMDB hydration lane for poster, backdrop and metadata.
+# Two workers is the hard ceiling across Grid/Details background hydration.
+_GLOBAL_HYDRATION_EXECUTOR = PriorityLazyExecutor(max_workers=2,max_pending=40,thread_name_prefix="ultrastalker-hydrate")
+_DETAIL_PREFETCH_EXECUTOR = _GLOBAL_HYDRATION_EXECUTOR
+_DETAIL_LOGO_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-details-logo")
+_FAST_POSTER_EXECUTOR = _GLOBAL_HYDRATION_EXECUTOR
+_POSTER_RESCUE_EXECUTOR = _GLOBAL_HYDRATION_EXECUTOR
+_QUALITY_PREFETCH_EXECUTOR = METADATA_EXECUTOR
+_GRID_EPG_EXECUTOR = METADATA_EXECUTOR
+_PGV2_HERO_EXECUTOR = PriorityLazyExecutor(max_workers=2,max_pending=4,thread_name_prefix="ultrastalker-pgv2-hero")
+_PGV2_MATERIAL_EXECUTOR = PriorityLazyExecutor(max_workers=1,max_pending=2,thread_name_prefix="ultrastalker-pgv2-material")
+_GRID_ACCENT_EXECUTOR = _IMAGE_WORK_EXECUTOR
+_POSTER_THUMB_EXECUTOR = _IMAGE_WORK_EXECUTOR
+_CATEGORY_PREFETCH_EXECUTOR = CATALOGUE_EXECUTOR
 # beta58: series hierarchy network warming must never share the page/category lane.
 # A slow get_series_info request previously blocked adjacent-page preparation and
 # could make Portal navigation feel slow after browsing M3U Series.
-_SERIES_HIERARCHY_PREFETCH_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-series-hierarchy")
-_PROGRESSIVE_POSTER_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-poster-progressive")
-_PICON_CACHE_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-picon-cache")
-_CATEGORY_CACHE = {}
+_SERIES_HIERARCHY_PREFETCH_EXECUTOR = CATALOGUE_EXECUTOR
+_PICON_CACHE_EXECUTOR = CACHE_IO_EXECUTOR
+# Test69: cache pruning must never compete with first-paint/image work.
+_MAINTENANCE_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-maintenance")
+_CATEGORY_CACHE = OrderedDict()
 _CATEGORY_CACHE_LOCK = threading.RLock()
 _CATEGORY_CACHE_TTL = 300.0
+_CATEGORY_CACHE_LIMIT = 384
+_CATEGORY_LAST_GOOD_DIR = os.path.join(PERSISTENT_GENERATED_DIR, "category_last_good")
+
+# R268: portal-specific Home cold-start work is completed while the existing
+# Splash is visible.  The warmed PortalSession is the same singleton Home later
+# receives, category rows are hydrated into the normal RAM cache, and large Home
+# pixmaps are decoded once into a tiny boot cache so Home can bind them without
+# another visible HDD/decode beat.
+_SPLASH_HOME_WARM_LOCK = threading.RLock()
+_SPLASH_HOME_WARM = OrderedDict()
+_SPLASH_HOME_WARM_LIMIT = 8
+_HOME_BOOT_PIXMAP_LOCK = threading.RLock()
+_HOME_BOOT_PIXMAPS = OrderedDict()
+_HOME_BOOT_PIXMAP_LIMIT = 16
+
+def _splash_profile_key(profile):
+    profile=profile if isinstance(profile,dict) else {}
+    return (str(profile.get("portal") or "").rstrip("/").lower(),
+            str(profile.get("mac") or "").upper(),
+            str(profile.get("source_type") or "stalker").lower())
+
+def _remember_splash_home_warm(profile, account_info=None, category_ready=None, recent_art=None, recent_progress=None):
+    key=_splash_profile_key(profile)
+    state={"launch":current_plugin_launch(),"stamp":time.monotonic(),
+           "account_info":dict(account_info or {}) if isinstance(account_info,dict) else {},
+           "category_ready":tuple(category_ready or ()),
+           "recent_art":dict(recent_art or {}) if isinstance(recent_art,dict) else {},
+           "recent_progress":dict(recent_progress or {}) if isinstance(recent_progress,dict) else {}}
+    with _SPLASH_HOME_WARM_LOCK:
+        _SPLASH_HOME_WARM[key]=state
+        try:_SPLASH_HOME_WARM.move_to_end(key)
+        except Exception:pass
+        while len(_SPLASH_HOME_WARM)>_SPLASH_HOME_WARM_LIMIT:
+            try:_SPLASH_HOME_WARM.popitem(last=False)
+            except Exception:break
+    return state
+
+def splash_home_warm_state(profile):
+    key=_splash_profile_key(profile)
+    with _SPLASH_HOME_WARM_LOCK:
+        state=_SPLASH_HOME_WARM.get(key)
+        if not isinstance(state,dict) or state.get("launch")!=current_plugin_launch():return {}
+        try:_SPLASH_HOME_WARM.move_to_end(key)
+        except Exception:pass
+        return dict(state)
+
+def splash_home_is_warm(profile):
+    return bool(splash_home_warm_state(profile))
+
+def splash_home_account_info(profile):
+    state=splash_home_warm_state(profile)
+    info=state.get("account_info") if isinstance(state,dict) else None
+    return dict(info) if isinstance(info,dict) else {}
+
+def splash_home_recent_assets(profile):
+    state=splash_home_warm_state(profile)
+    art=state.get("recent_art") if isinstance(state,dict) else None
+    progress=state.get("recent_progress") if isinstance(state,dict) else None
+    return (dict(art or {}) if isinstance(art,dict) else {},
+            dict(progress or {}) if isinstance(progress,dict) else {})
+
+def _boot_pixmap_put(path,pix):
+    if not path or pix is None:return
+    path=os.path.realpath(str(path))
+    with _HOME_BOOT_PIXMAP_LOCK:
+        _HOME_BOOT_PIXMAPS[path]=pix
+        try:_HOME_BOOT_PIXMAPS.move_to_end(path)
+        except Exception:pass
+        while len(_HOME_BOOT_PIXMAPS)>_HOME_BOOT_PIXMAP_LIMIT:
+            try:_HOME_BOOT_PIXMAPS.popitem(last=False)
+            except Exception:break
+
+def home_boot_pixmap(path):
+    if not path:return None
+    path=os.path.realpath(str(path))
+    with _HOME_BOOT_PIXMAP_LOCK:
+        pix=_HOME_BOOT_PIXMAPS.get(path)
+        if pix is not None:
+            try:_HOME_BOOT_PIXMAPS.move_to_end(path)
+            except Exception:pass
+        return pix
+
+def _page_cache_file(path):
+    """Read a local artwork file once so setPixmapFromFile never waits on HDD."""
+    try:
+        if not path or not os.path.isfile(path):return False
+        with open(path,"rb") as fh:
+            while fh.read(256*1024):pass
+        return True
+    except Exception:return False
+
+def _prime_home_boot_artwork():
+    hero={}
+    try:
+        if HOME_HERO_FILE and os.path.isfile(HOME_HERO_FILE):
+            with open(HOME_HERO_FILE,"r",encoding="utf-8") as fh:state=json.load(fh)
+            if isinstance(state,dict) and int(state.get("schema") or 0)==HOME_HERO_SCHEMA and isinstance(state.get("hero"),dict):
+                hero=dict(state.get("hero") or {})
+    except Exception as exc:optional_failure("ui.splash_home_hero_read",exc)
+    if not hero:return {}
+    title_logo=str(hero.get("title_logo_local") or "")
+    if not title_logo:
+        try:
+            from .title_logo_ultra import ultra_title_logo_cached
+            media=str(hero.get("media_type") or "vod")
+            title=str(hero.get("title") or "")
+            title_logo=ultra_title_logo_cached(media,hero,hero,(432,210),title) or ""
+            if title_logo:hero["title_logo_local"]=title_logo
+        except Exception as exc:optional_failure("ui.splash_home_logo_cache",exc)
+    candidates=[]
+    for key in ("prepared","display_backdrop_local","backdrop_local","display_poster_local","poster_local"):
+        value=str(hero.get(key) or "")
+        if value and value not in candidates:candidates.append(value)
+    if title_logo and title_logo not in candidates:candidates.append(title_logo)
+    for path in candidates:
+        _page_cache_file(path)
+    return hero
+
+def _persist_splash_home_logo(hero,path,resolved=None):
+    if not (isinstance(hero,dict) and path and HOME_HERO_FILE):return False
+    resolved=resolved if isinstance(resolved,dict) else {}
+    try:
+        with _HOME_HERO_LOCK:
+            with open(HOME_HERO_FILE,"r",encoding="utf-8") as fh:state=json.load(fh)
+            current=state.get("hero") if isinstance(state,dict) and isinstance(state.get("hero"),dict) else None
+            if not current:return False
+            current["title_logo_local"]=str(path)
+            for key in ("original_language","origin_country","countries","production_countries","country_hint"):
+                value=resolved.get(key)
+                if value not in (None,"",[],{}):current[key]=value
+            folder=os.path.dirname(HOME_HERO_FILE) or "/tmp"
+            fd,tmp=tempfile.mkstemp(prefix=".splash-hero-logo.",suffix=".tmp",dir=folder)
+            try:
+                with os.fdopen(fd,"w",encoding="utf-8") as fh:
+                    json.dump(state,fh,ensure_ascii=False,separators=(",",":"));fh.flush();os.fsync(fh.fileno())
+                os.chmod(tmp,0o600);os.replace(tmp,HOME_HERO_FILE)
+            finally:
+                if os.path.exists(tmp):
+                    try:os.unlink(tmp)
+                    except OSError:pass
+        return True
+    except Exception as exc:
+        optional_failure("ui.splash_home_logo_persist",exc);return False
+
+def splash_prime_home_pixmaps_gui():
+    """Decode the already page-cached Home PNGs while Splash owns the GUI.
+
+    Called only from the Enigma2 main thread by HomeWarmupSplashScreen. This
+    keeps receiver-specific loadPNG work out of background threads.
+    """
+    hero=_prime_home_boot_artwork()
+    if not isinstance(hero,dict) or not hero:return 0
+    candidates=[]
+    for key in ("prepared","display_backdrop_local","backdrop_local","title_logo_local"):
+        value=str(hero.get(key) or "")
+        if value and value not in candidates:candidates.append(value)
+    decoded=0
+    for name in ("home_live.png","home_movies.png","home_series.png","home_catchup.png","home_favorites.png","home_search.png","home_settings.png"):
+        try:
+            path=asset(name)
+            if path and path not in candidates:candidates.append(path)
+        except Exception:pass
+    for path in candidates:
+        try:
+            if not str(path).lower().endswith(".png") or not os.path.isfile(path):continue
+            pix=loadPNG(str(path))
+            if pix is not None:
+                _boot_pixmap_put(path,pix);decoded+=1
+        except Exception as exc:optional_failure("ui.splash_home_pixmap",exc)
+    return decoded
+
+def _splash_recent_series_identity(item,mtype):
+    item=item if isinstance(item,dict) else {}
+    mt=str(mtype or "").lower()
+    keys=("_series_tmdb_id","series_tmdb_id","tv_tmdb_id") + (("_locked_tmdb_id","tmdb_id") if mt=="series" else ())
+    for key in keys:
+        value=item.get(key)
+        if value not in (None,""):return "tmdb:%s"%str(value).strip()
+    pkeys=("_series_id","series_id","series_uid","parent_id","series") if mt=="episode" else ("series_id","id","series_uid","_series_id")
+    for key in pkeys:
+        value=item.get(key)
+        if value not in (None,""):return "provider:%s"%str(value).strip()
+    raw=item.get("_series_title") or item.get("series_title") or item.get("series_name") or (item.get("name") if mt!="episode" else "") or item.get("title") or ""
+    title=re.sub(r"[^\w\u0600-\u06ff]+"," ",str(raw or "").casefold(),flags=re.UNICODE)
+    title=re.sub(r"\s+"," ",title).strip()
+    return "title:%s"%title if title else ""
+
+def _splash_recent_rows(profile):
+    portal=str((profile or {}).get("portal") or "").rstrip("/").lower();mac=str((profile or {}).get("mac") or "").upper()
+    groups=[[],[],[]];seen_series=set()
+    try:recent=load_recently_played() or []
+    except Exception:recent=[]
+    for entry in recent:
+        if not isinstance(entry,dict):continue
+        if str(entry.get("portal") or "").rstrip("/").lower()!=portal:continue
+        if entry.get("mac") and str(entry.get("mac") or "").upper()!=mac:continue
+        item=entry.get("item") if isinstance(entry.get("item"),dict) else entry
+        mtype=str(entry.get("media_type") or item.get("_saved_media_type") or "").lower()
+        group=0 if mtype in ("itv","live") else (1 if mtype=="vod" else (2 if mtype in ("series","episode") else -1))
+        if group<0:continue
+        if group==2:
+            identity=_splash_recent_series_identity(item,mtype)
+            if identity and identity in seen_series:continue
+            if identity:seen_series.add(identity)
+        if len(groups[group])<3:groups[group].append((entry,item,mtype))
+        if all(len(rows)>=3 for rows in groups):break
+    for rows in groups:
+        while len(rows)<3:rows.append(None)
+    return groups[0]+groups[1]+groups[2]
+
+def _splash_prepare_recent_assets(profile):
+    art={};progress={};rows=_splash_recent_rows(profile)
+    for i,packed in enumerate(rows):
+        if not packed:continue
+        entry,item,mtype=packed;group=max(0,min(2,i//3))
+        size=(220,132) if group==0 else (190,272)
+        ph=("us168_live_placeholder_220x132.png","grid_placeholder_movie_921.png","grid_placeholder_series_921.png")[group]
+        try:
+            cached=_home_cached_art(item,profile,size,ph,mtype)
+            if group==0 and cached and os.path.isfile(str(cached)) and os.path.basename(str(cached))!=os.path.basename(str(asset(ph))):
+                fitted=_fit_live_picon_canvas(str(cached),PERSISTENT_GENERATED_DIR,(220,132))
+                art[i]=str(fitted or cached)
+            elif cached:
+                art[i]=str(cached)
+            if art.get(i):_page_cache_file(art[i])
+        except Exception as exc:optional_failure("ui.splash_recent_art",exc)
+        if group in (1,2):
+            try:
+                pos=max(0,int(entry.get("_position") or 0));dur=max(0,int(entry.get("_duration") or 0));completed=bool(entry.get("_completed"))
+                pct=min(100,int(pos*100.0/dur)) if pos and dur else (100 if completed else 0)
+                if pct>0:
+                    from .ui_cinematic_global import _cinematic_row_progress_frame
+                    path=_cinematic_row_progress_frame("#5fc49a",pct,width=277) or ""
+                    if path:
+                        progress[i]=str(path);_page_cache_file(path)
+            except Exception as exc:optional_failure("ui.splash_recent_progress",exc)
+    return art,progress
+
+def splash_warm_home_profile(profile, progress=None):
+    """Complete selected-portal Home work before Home is ever painted.
+
+    `progress` is a worker-safe callback accepting (percent, status).  Network
+    category calls use the shared PortalSession singleton, so Home inherits the
+    already-authorized client instead of opening another connection.
+    """
+    profile=dict(profile or {})
+    ready=[];account={}
+    def report(pct,text):
+        if callable(progress):
+            try:progress(int(pct),str(text or ""))
+            except Exception:pass
+    hero=_prime_home_boot_artwork()
+    # If the pinned Home title logo is missing, resolve it here while Splash is
+    # still visible. Home therefore never starts a title-logo network job or
+    # swaps text -> logo after the viewer has already arrived.
+    if isinstance(hero,dict) and hero:
+        try:
+            from .title_logo_runtime import valid_ultra_title_logo
+            from .title_logo_ultra import ultra_title_logo_cached, resolve_ultra_title_logo
+            media=str(hero.get("media_type") or "vod");title=str(hero.get("title") or "")
+            logo=str(hero.get("title_logo_local") or "")
+            if not valid_ultra_title_logo(logo):
+                logo=ultra_title_logo_cached(media,hero,hero,(432,210),title) or ""
+            resolved={}
+            if not valid_ultra_title_logo(logo):
+                logo,resolved=resolve_ultra_title_logo(profile,media,hero,hero,(432,210),title,settings=(load_settings() or {}))
+                logo=str(logo or "")
+            if logo and valid_ultra_title_logo(logo):
+                _persist_splash_home_logo(hero,logo,resolved);_page_cache_file(logo)
+        except Exception as exc:optional_failure("ui.splash_home_logo_resolve",exc)
+    report(25,_('Preparing Home artwork'))
+    session=PortalSession(profile,timeout=(load_settings() or {}).get("timeout",10))
+    client=session.client
+    source_type=str(profile.get("source_type") or ("m3u" if _looks_like_m3u_url(profile.get("portal")) else "stalker")).lower()
+    media_steps=(("itv",50,_('Preparing Live categories')),("vod",75,_('Preparing Movie categories')),("series",75,_('Preparing Series categories')))
+    for media,pct,label in media_steps:
+        report(pct,label)
+        rows=None
+        try:rows=_category_cache_get(profile,media)
+        except Exception as exc:optional_failure("ui.splash_category_cache_%s"%media,exc)
+        # M3U catalogues may be multi-minute downloads. Preserve the established
+        # lazy M3U contract: hydrate last-good rows here, never parse a huge
+        # playlist merely to satisfy startup warmup.
+        if rows is None and source_type!="m3u":
+            try:
+                rows=client.genres(media)
+                if isinstance(rows,list) and rows:_category_cache_put(profile,media,rows)
+            except Exception as exc:optional_failure("ui.splash_category_%s"%media,exc)
+        if isinstance(rows,list) and rows:ready.append(media)
+    report(75,_('Preparing recent cards'))
+    recent_art,recent_progress=_splash_prepare_recent_assets(profile)
+    report(75,_('Preparing account'))
+    if source_type!="m3u":
+        try:
+            info=client.account_info()
+            if isinstance(info,dict):account=dict(info)
+        except Exception as exc:optional_failure("ui.splash_account",exc)
+    if account:
+        try:
+            expiry=account.get("phone") or account.get("end_date") or account.get("expire_billing_date") or ""
+            state=account.get("status") or account.get("account_status") or "CONNECTED"
+            profile["expiry"]=str(expiry or "");profile["account_state"]=str(state or "")
+            if expiry:profile["state"]="%s / %s"%(str(state),str(expiry))
+            profiles=load_profiles();target=_splash_profile_key(profile)
+            found=False
+            for row in profiles:
+                if _splash_profile_key(row)==target:
+                    row.update({"expiry":profile.get("expiry",""),"account_state":profile.get("account_state",""),"state":profile.get("state","")});found=True;break
+            if not found:profiles.append(dict(profile))
+            save_profiles(profiles)
+        except Exception as exc:optional_failure("ui.splash_account_persist",exc)
+    _remember_splash_home_warm(profile,account_info=account,category_ready=ready,recent_art=recent_art,recent_progress=recent_progress)
+    report(100,_('Ready'))
+    return {"category_ready":tuple(ready),"account_info":account}
 
 def _category_cache_key(profile, media_type):
     return (str((profile or {}).get("portal") or "").rstrip("/").lower(), str((profile or {}).get("mac") or "").upper(), str(media_type or "").lower())
 
+def _category_cache_disk_path(profile, media_type):
+    key=_category_cache_key(profile,media_type)
+    digest=hashlib.sha1(("|".join(key)).encode("utf-8","ignore")).hexdigest()
+    return os.path.join(_CATEGORY_LAST_GOOD_DIR,"%s.json"%digest)
+
 def _category_cache_get(profile, media_type):
+    """Return the last successful category catalogue immediately.
+
+    RAM remains the hot five-minute layer.  The HDD copy is deliberately
+    last-good rather than expiring data: Portal categories are tiny routing
+    records, and showing the last known-good list is much better than exposing
+    an empty backdrop because one Stalker loader request hiccupped.  The
+    Categories screen refreshes stale HDD data quietly after first paint.
+    """
     key = _category_cache_key(profile, media_type)
     now = time.monotonic()
     with _CATEGORY_CACHE_LOCK:
         row = _CATEGORY_CACHE.get(key)
-        if not row: return None
-        stamp, data = row
-        if now - stamp > _CATEGORY_CACHE_TTL:
-            _CATEGORY_CACHE.pop(key, None); return None
-        return [dict(x) if isinstance(x, dict) else x for x in data]
+        if row:
+            stamp,data=row
+            try:_CATEGORY_CACHE.move_to_end(key)
+            except Exception as exc:optional_failure("ui.category_cache_lru",exc)
+            # Keep the row even after the hot TTL; callers may paint it while a
+            # silent refresh happens.  The age helper decides refresh policy.
+            return [dict(x) if isinstance(x,dict) else x for x in data]
+    path=_category_cache_disk_path(profile,media_type)
+    try:
+        if hdd_read_ready() and os.path.isfile(path):
+            with open(path,"r",encoding="utf-8") as fh:payload=json.load(fh)
+            data=payload.get("rows") if isinstance(payload,dict) else None
+            if isinstance(data,list) and data:
+                clean=[dict(x) if isinstance(x,dict) else x for x in data]
+                # Disk rows are stale-safe first paint. Give them an old RAM
+                # stamp so the screen knows to refresh quietly.
+                with _CATEGORY_CACHE_LOCK:
+                    _CATEGORY_CACHE[key]=(now-_CATEGORY_CACHE_TTL-1.0,clean)
+                    try:_CATEGORY_CACHE.move_to_end(key)
+                    except Exception as exc:optional_failure("ui.category_cache_lru",exc)
+                return [dict(x) if isinstance(x,dict) else x for x in clean]
+    except Exception as exc:optional_failure("ui.category_last_good_read",exc)
+    return None
+
+def _category_cache_age(profile, media_type):
+    key=_category_cache_key(profile,media_type)
+    with _CATEGORY_CACHE_LOCK:
+        row=_CATEGORY_CACHE.get(key)
+        if row:
+            try:return max(0.0,time.monotonic()-float(row[0]))
+            except Exception:return _CATEGORY_CACHE_TTL+1.0
+    return _CATEGORY_CACHE_TTL+1.0
+
+def _category_cache_write_disk(profile,media_type,clean):
+    path=_category_cache_disk_path(profile,media_type)
+    try:
+        if not _persistent_write_ok(_CATEGORY_LAST_GOOD_DIR):return
+        os.makedirs(_CATEGORY_LAST_GOOD_DIR,mode=0o700,exist_ok=True)
+        temp=path+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
+        _persistent_write_require(temp)
+        with open(temp,"w",encoding="utf-8") as fh:
+            json.dump({"schema":1,"updated_at":int(time.time()),"rows":clean},fh,ensure_ascii=False,separators=(",",":"));fh.flush();os.fsync(fh.fileno())
+        _persistent_write_require(path);os.replace(temp,path)
+    except Exception as exc:optional_failure("ui.category_last_good_write",exc)
 
 def _category_cache_put(profile, media_type, rows):
-    if not isinstance(rows, list): return
+    if not isinstance(rows, list) or not rows:return
     key = _category_cache_key(profile, media_type)
     clean = [dict(x) if isinstance(x, dict) else x for x in rows]
     with _CATEGORY_CACHE_LOCK:
-        _CATEGORY_CACHE[key] = (time.monotonic(), clean)
+        _CATEGORY_CACHE[key]=(time.monotonic(),clean)
+        try:_CATEGORY_CACHE.move_to_end(key)
+        except Exception as exc:optional_failure("ui.category_cache_lru",exc)
+        while len(_CATEGORY_CACHE)>_CATEGORY_CACHE_LIMIT:
+            try:_CATEGORY_CACHE.popitem(last=False)
+            except Exception:break
+    # Never make category first-paint wait for fsync. One low-priority worker
+    # persists only successful catalogues.
+    try:_CATEGORY_PREFETCH_EXECUTOR.submit(_category_cache_write_disk,dict(profile or {}),str(media_type or ""),clean)
+    except Exception as exc:optional_failure("ui.category_last_good_submit",exc)
+
+def _invalidate_source_navigation_cache(profile):
+    """Drop only navigation/catalogue first-paint caches for one selected source."""
+    removed=0
+    for media_type in ("itv","vod","series"):
+        key=_category_cache_key(profile,media_type)
+        with _CATEGORY_CACHE_LOCK:
+            if _CATEGORY_CACHE.pop(key,None) is not None:removed+=1
+        path=_category_cache_disk_path(profile,media_type)
+        try:
+            if os.path.isfile(path):os.remove(path);removed+=1
+        except OSError as exc:optional_failure("ui.category_refresh_cache_remove",exc)
+    return removed
 
 
 
@@ -1164,8 +1838,25 @@ _GRID_ACCENT_CACHE_LIMIT = 192
 
 # Session navigation memory. Keys include portal/media/category so returning from
 # details, playback or a recreated grid lands on the exact previous item.
-_GRID_NAV_STATE = {}
-_CATEGORY_NAV_STATE = {}
+class _BoundedNavState(OrderedDict):
+    def __init__(self,limit):
+        OrderedDict.__init__(self);self.limit=max(16,int(limit))
+    def __setitem__(self,key,value):
+        OrderedDict.__setitem__(self,key,value)
+        try:self.move_to_end(key)
+        except Exception as exc:optional_failure("ui.nav_state_lru",exc)
+        while len(self)>self.limit:
+            try:self.popitem(last=False)
+            except Exception:break
+    def get(self,key,default=None):
+        value=OrderedDict.get(self,key,default)
+        if key in self:
+            try:self.move_to_end(key)
+            except Exception as exc:optional_failure("ui.nav_state_lru",exc)
+        return value
+
+_GRID_NAV_STATE = _BoundedNavState(512)
+_CATEGORY_NAV_STATE = _BoundedNavState(256)
 _ARTWORK_FAILURES = {}
 _ARTWORK_FAILURE_LOCK = threading.Lock()
 _ARTWORK_FAILURE_LIMIT = 1024
@@ -1190,7 +1881,10 @@ def _artwork_target_lock(path):
 
 def shutdown_ui_workers(wait=False):
     """Stop module-level artwork/EPG executors during Enigma2 GUI shutdown."""
-    for executor in (_IMAGE_EXECUTOR, _ADAPTIVE_EXECUTOR, _BACKDROP_PRESENT_EXECUTOR, _DETAIL_PREFETCH_EXECUTOR, _FAST_POSTER_EXECUTOR, _POSTER_RESCUE_EXECUTOR, _QUALITY_PREFETCH_EXECUTOR, _GRID_EPG_EXECUTOR, _GRID_ACCENT_EXECUTOR, _POSTER_THUMB_EXECUTOR, _CATEGORY_PREFETCH_EXECUTOR, _SERIES_HIERARCHY_PREFETCH_EXECUTOR):
+    _shutdown_executors=[]
+    for executor in (_IMAGE_EXECUTOR, _ADAPTIVE_EXECUTOR, _BACKDROP_PRESENT_EXECUTOR, _DETAIL_LOGO_EXECUTOR, _GRID_MOOD_EXECUTOR, _GLOBAL_HYDRATION_EXECUTOR, _PGV2_HERO_EXECUTOR, _PGV2_MATERIAL_EXECUTOR, _GRID_ACCENT_EXECUTOR, _POSTER_THUMB_EXECUTOR, _MAINTENANCE_EXECUTOR):
+        if executor not in _shutdown_executors:_shutdown_executors.append(executor)
+    for executor in _shutdown_executors:
         try: executor.shutdown(wait=bool(wait), cancel_futures=True)
         except TypeError: executor.shutdown(wait=bool(wait))
         except Exception as exc: optional_failure("ui", exc)
@@ -1201,13 +1895,13 @@ def shutdown_ui_workers(wait=False):
 def _friendly_error(value):
     text = one_line(value, 220)
     low = text.casefold()
-    if "non-json" in low: return "The portal returned an invalid page. Press YELLOW to retry."
-    if "timed out" in low or "timeout" in low: return "The portal took too long to respond. Press YELLOW to retry."
-    if "http 401" in low or "unauthor" in low: return "Authorization expired. Press GREEN to authorize again."
+    if "non-json" in low: return _("Content temporarily unavailable. Try again.")
+    if "timed out" in low or "timeout" in low: return _("Connection timed out. Check the portal address, internet connection, and server availability.")
+    if "http 401" in low or "unauthor" in low: return _("The portal rejected authentication. Check the MAC address and whether the subscription is active.")
     if "security consent" in low or "fallback is not approved" in low or "certificate verification" in low:
-        return "A safer connection could not be used. Open MENU > Portal manager and approve the required TLS/HTTP fallback for this portal."
-    if "connection" in low: return "Could not reach the portal. Check the network and try again."
-    return text or "The request could not be completed."
+        return _("TLS certificate validation failed. Verify the portal URL or adjust TLS mode later from Portal Manager.")
+    if "connection" in low: return _("The portal server could not be reached. Check the address, network, and whether the server is online.")
+    return text or _("Content temporarily unavailable. Try again.")
 
 
 
@@ -1221,7 +1915,7 @@ def _load_recent_searches():
             return []
         with open(RECENT_SEARCH_FILE, "r", encoding="utf-8") as h:
             data = json.load(h)
-        return [str(x) for x in data if str(x).strip()][:8] if isinstance(data, list) else []
+        return [str(x) for x in data if str(x).strip()][:100] if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -1230,7 +1924,7 @@ def _save_recent_search(term):
     if not term: return
     with _RECENT_SEARCH_LOCK:
         items = [x for x in _load_recent_searches() if x.lower() != term.lower()]
-        items.insert(0, term); items = items[:8]
+        items.insert(0, term); items = items[:100]
         tmp = None
         try:
             directory=os.path.dirname(RECENT_SEARCH_FILE);os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -1370,13 +2064,36 @@ def cleanup_image_cache(max_files=None, max_bytes=None):
         # conservative count limit.
         max_files = None if persistent_media else max(240, min(4000, int(art_bytes // (180 * 1024))))
     _cleanup_cache_dir(IMAGE_CACHE_DIR, max_files, art_bytes)
-    # Derived thumbs are cheap to recreate, so keep them bounded independently.
-    thumb_bytes = 0 if max_bytes == 0 else max(24 * 1024 * 1024, int(max_bytes * 0.75))
-    if requested_files == 0:
-        thumb_files=0
-    else:
-        thumb_files=max(400,min(6000,int(max(1,thumb_bytes)//(72*1024))))
-    _cleanup_cache_dir(THUMB_CACHE_DIR, thumb_files, thumb_bytes)
+    # URL-keyed provider/TMDB source bytes are only staging. They must never
+    # become a second persistent poster/backdrop library beside TMDB identity.
+    source_bytes = 0 if max_bytes == 0 else max(16 * 1024 * 1024, int(max_bytes * 0.50))
+    source_files = 0 if requested_files == 0 else max(160,min(2400,int(max(1,source_bytes)//(96*1024))))
+    _cleanup_cache_dir(SOURCE_POSTER_CACHE_DIR, source_files, source_bytes)
+    _cleanup_cache_dir(SOURCE_BACKDROP_CACHE_DIR, max(80,source_files//2) if source_files else 0, source_bytes)
+    # release Persistent presentation vault:
+    # On a real HDD, GENERATED contains the decoder-ready Cinematic backdrop,
+    # title-logo/adaptive presentation assets and other Stable-Focus results.
+    # These are part of the user's persistent library, not disposable thumbs.
+    # Automatic maintenance must therefore never evict them merely because a
+    # newer folder was cached.  Only an explicit Clear Cache request
+    # (max_files=0,max_bytes=0) is allowed to remove this vault.
+    explicit_clear = (requested_files == 0 and max_bytes == 0)
+    generated_persistent = False
+    try:
+        _gen=os.path.abspath(PERSISTENT_GENERATED_DIR);_root=os.path.abspath(PERSISTENT_CACHE_ROOT)
+        generated_persistent=bool(_gen==_root or _gen.startswith(_root+os.sep))
+    except Exception:
+        generated_persistent=False
+    if (not generated_persistent) or explicit_clear:
+        # PerfLab: view-specific derivatives are session/volatile assets. Keep
+        # them under the normal image-cache budget instead of the multi-GB HDD
+        # persistent budget used for canonical poster/backdrop originals.
+        thumb_bytes = 0 if max_bytes == 0 else max(24 * 1024 * 1024, int(max_bytes * 0.75))
+        if requested_files == 0:
+            thumb_files=0
+        else:
+            thumb_files=max(400,min(6000,int(max(1,thumb_bytes)//(72*1024))))
+        _cleanup_cache_dir(THUMB_CACHE_DIR, thumb_files, thumb_bytes)
 
 
 def _thumb_path(digest, size):
@@ -1402,6 +2119,16 @@ def _valid_cache_file(path, ttl=IMAGE_CACHE_TTL):
             age = max(0, now - stat.st_mtime)
             if age > float(ttl):
                 return False
+        # Generated presentation files are reproducible, but navigation can use
+        # them heavily. Keep a write-light in-memory last-use ledger so the
+        # background cache guard can evict stale assets instead of hot ones.
+        try:
+            abs_path=os.path.abspath(str(path))
+            generated_root=os.path.abspath(PERSISTENT_GENERATED_DIR)
+            if abs_path.startswith(generated_root+os.sep):
+                note_generated_use(abs_path)
+        except Exception:
+            pass
         return True
     except OSError:
         return False
@@ -1415,6 +2142,8 @@ from .ui_dynamic_chrome import (
     _build_aux_adaptive_chrome,
     _build_home_adaptive_focus,
     _build_category_adaptive_chrome,
+    _build_category_extended_backdrop,
+    _build_dynamic_settings_episode_rows,
     _build_poster_adaptive_chrome_clean,
     _build_live_adaptive_chrome_211,
     _build_home_mood_assets,
@@ -1425,18 +2154,38 @@ _configure_dynamic_chrome(
     _persistent_write_require,
     _valid_cache_file,
     CATEGORY_ADAPTIVE_TMP_DIR,
+    ADAPTIVE_CHROME_DIR,
 )
 
 
 
-def _find_original_artwork(digest):
-    cached=_cached_artwork_path(digest)
+def _find_original_artwork(digest, landscape=False):
+    """Resolve provider artwork from the one fixed HDD poster/backdrop store."""
+    cache_key=("b:" if landscape else "p:")+str(digest)
+    cached=_cached_artwork_path(cache_key) or (None if landscape else _cached_artwork_path(str(digest)))
     if cached:return cached
+    base=SOURCE_BACKDROP_CACHE_DIR if landscape else SOURCE_POSTER_CACHE_DIR
     for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        path = os.path.join(IMAGE_CACHE_DIR, digest + ext)
+        path=os.path.join(base,digest+ext)
         if _valid_cache_file(path):
-            _cache_artwork_path(digest,path)
-            return path
+            _cache_artwork_path(("b:" if landscape else "p:")+str(digest),path);return path
+    # Lazy, non-destructive adoption of the old flat provider-art folder.
+    legacy=os.path.join(PERSISTENT_CACHE_ROOT,"live")
+    if os.path.abspath(legacy)!=os.path.abspath(base):
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            source=os.path.join(legacy,digest+ext)
+            if not _valid_cache_file(source):continue
+            target=os.path.join(base,digest+ext)
+            try:
+                if _persistent_write_ok(target):
+                    ensure_persistent_dirs(base)
+                    try:os.replace(source,target)
+                    except Exception:
+                        import shutil as _us_shutil
+                        _us_shutil.copy2(source,target)
+                    if _valid_cache_file(target):source=target
+            except Exception:pass
+            _cache_artwork_path(("b:" if landscape else "p:")+str(digest),source);return source
     return None
 
 
@@ -1541,7 +2290,7 @@ def _queue_thumbnail_build(source_path, target_path, size):
             with _THUMB_BUILDING_LOCK:
                 _THUMB_BUILDING.discard(key)
     try:
-        _IMAGE_EXECUTOR.submit(worker)
+        _MAINTENANCE_EXECUTOR.submit(worker)
     except Exception:
         with _THUMB_BUILDING_LOCK:
             _THUMB_BUILDING.discard(key)
@@ -1606,6 +2355,10 @@ def _schedule_startup_cache_maintenance():
         global _STARTUP_CACHE_INIT_SCHEDULED,_STARTUP_CACHE_MAINT_DONE
         completed=False
         try:
+            # Test69 Lean runtime: cache maintenance is background housekeeping,
+            # never part of plugin first paint.  Give the user three minutes of
+            # uncontended UI/network time before any full HDD walk can begin.
+            time.sleep(180.0)
             if not initialize_persistent_cache_once():
                 return
             marker=os.path.join(PERSISTENT_CACHE_ROOT,".maintenance_stamp")
@@ -1616,15 +2369,34 @@ def _schedule_startup_cache_maintenance():
             if age < 6*60*60:
                 completed=True
                 return
-            cfg=load_settings();persistent_mb=int(cfg.get("persistent_cache_mb",20480) or 8192)
-            cleanup_image_cache()
-            prune_persistent_cache(persistent_mb*1024*1024)
+            # Generated presentation assets are reproducible and now have their
+            # own bounded guard. Posters/backdrops/library/index are deliberately
+            # outside this maintenance path. The walk runs only in this delayed
+            # background worker, never while the user is key-repeating through UI.
+            try:
+                maintain_generated_cache()
+            except Exception as exc:
+                optional_failure("generated-cache-maintenance",exc)
             temp=marker+".tmp.%d"%os.getpid()
-            _persistent_write_require(temp)
+            # R62: marker names are dot-files with no conventional extension.
+            # persistent_write_gate() quite reasonably treats extensionless
+            # targets as directories, so gating the marker path itself created
+            # an empty `.maintenance_stamp/` directory.  The following
+            # os.replace(temp, marker) then failed with EISDIR and startup cache
+            # maintenance retried forever.  Gate the parent directory instead;
+            # this is the actual write target we need to validate.
+            marker_dir=os.path.dirname(marker) or PERSISTENT_CACHE_ROOT
+            _persistent_write_require(marker_dir)
+            # Clean up only the exact empty directory left by the old bug.
+            # Never recurse and never delete a non-empty path.
+            if os.path.isdir(marker):
+                try:os.rmdir(marker)
+                except OSError:
+                    return
             with open(temp,"w",encoding="ascii") as handle:
                 handle.write(str(int(time.time())))
                 handle.flush();os.fsync(handle.fileno())
-            _persistent_write_require(marker)
+            _persistent_write_require(marker_dir)
             os.replace(temp,marker)
             try:os.chmod(marker,0o600)
             except OSError:pass
@@ -1637,7 +2409,7 @@ def _schedule_startup_cache_maintenance():
                 if completed:
                     _STARTUP_CACHE_MAINT_DONE=True
     try:
-        _IMAGE_EXECUTOR.submit(worker)
+        _MAINTENANCE_EXECUTOR.submit(worker)
     except Exception as exc:
         with _STARTUP_CACHE_INIT_LOCK:
             _STARTUP_CACHE_INIT_SCHEDULED=False
@@ -1736,7 +2508,7 @@ def _cached_portal_artwork(value, profile, landscape=False):
         if not url:return None
         url=_optimized_artwork_url(url,bool(landscape))
         digest=hashlib.sha1(url.encode("utf-8","ignore")).hexdigest()
-        path=_find_original_artwork(digest)
+        path=_find_original_artwork(digest,bool(landscape))
         if not path:return None
         if landscape and _PILImage is not None:
             try:
@@ -1749,6 +2521,13 @@ def _cached_portal_artwork(value, profile, landscape=False):
 
 
 def _live_picon_diag(message):
+    # Picon diagnostics are useful when explicitly enabled, but synchronous
+    # trace-file writes do not belong on the normal Live rendering path.
+    try:
+        if not LOG.isEnabledFor(10):
+            return
+    except Exception:
+        return
     try:
         root="/tmp/UltraStalker"
         try:os.makedirs(root,0o700,exist_ok=True)
@@ -2001,7 +2780,7 @@ def _download_live_portal_temp_picon(value, profile, client, item=None, timeout=
         except Exception as exc:diagnostic_failure("ui.failsoft.1767",exc)
         return None
 
-def _download_portal_artwork(value, profile, client, landscape=False, timeout=3.5, cancel_event=None, item=None):
+def _download_portal_artwork(value, profile, client, landscape=False, timeout=3.5, cancel_event=None, item=None, trace_cb=None, force_attempt=False):
     """HDD-first download for artwork supplied directly by the Stalker portal.
 
     This path deliberately runs before TMDB enrichment. It shares the same
@@ -2009,32 +2788,64 @@ def _download_portal_artwork(value, profile, client, landscape=False, timeout=3.
     becomes an immediate local hit everywhere else in the plugin.
     """
     if cancel_event is not None and cancel_event.is_set():return None
+    raw_value=value
     url=_source_art_url(value,profile,item)
-    if not url:return None
+    if not url:
+        if callable(trace_cb):
+            try:trace_cb("ARTWORK_SKIP reason=source_url raw=%r"%(str(raw_value or "")[:220],))
+            except Exception:pass
+        return None
     url=_optimized_artwork_url(url,bool(landscape))
-    if not url:return None
+    if not url:
+        if callable(trace_cb):
+            try:trace_cb("ARTWORK_SKIP reason=optimized_url raw=%r"%(str(raw_value or "")[:220],))
+            except Exception:pass
+        return None
     digest=hashlib.sha1(url.encode("utf-8","ignore")).hexdigest()
     with _artwork_file_lock(digest):
-        existing=_find_original_artwork(digest)
+        existing=_find_original_artwork(digest,bool(landscape))
         if existing:
             if not landscape or _PILImage is None:return existing
             try:
                 with _PILImage.open(existing) as im:
                     if float(im.width)/float(max(1,im.height))>=1.25:return existing
             except Exception as exc:optional_failure("ui.silent_guard",exc)
-        if not _artwork_attempt_allowed(url):return None
+        if not force_attempt and not _artwork_attempt_allowed(url):
+            if callable(trace_cb):
+                try:trace_cb("ARTWORK_SKIP reason=backoff url=%r"%(url,))
+                except Exception:pass
+            return None
         temp=None
         try:
-            if not _persistent_write_ok(IMAGE_CACHE_DIR): return None
+            store_dir=SOURCE_BACKDROP_CACHE_DIR if landscape else SOURCE_POSTER_CACHE_DIR
+            if not _persistent_write_ok(store_dir): return None
             if cancel_event is not None and cancel_event.is_set():raise _ArtworkCancelled()
             headers=_safe_image_headers(url,profile,client,item)
             req=urllib.request.Request(url,headers=headers)
-            opener=_safe_image_opener(url,profile)
-            temp=os.path.join(IMAGE_CACHE_DIR,"%s.download.%d.%d"%(digest,os.getpid(),threading.get_ident()))
-            total=0;head=b"";ctype=""
+            temp=os.path.join(store_dir,"%s.download.%d.%d"%(digest,os.getpid(),threading.get_ident()))
+            total=0;head=b"";ctype="";transport="safe"
             _persistent_write_require(temp)
-            with opener.open(req,timeout=max(2.0,min(float(timeout or 3.5),6.5))) as response, open(temp,"wb") as handle:
+            # Provider artwork URLs are provider-controlled resources. Xtream/M3U
+            # artwork in particular may legitimately live on a private/sibling CDN
+            # that the strict generic remote-media opener rejects before any HTTP
+            # request is made. Try the strict transport first, then the provider
+            # transport that is already used for user-configured Xtream/M3U URLs.
+            # Credentials are still protected by _safe_image_headers() and the
+            # ProviderRedirectHandler strips credential-like headers cross-origin.
+            try:
+                opener=_safe_image_opener(url,profile)
+                response_ctx=opener.open(req,timeout=max(2.0,min(float(timeout or 3.5),6.5)))
+            except Exception as first_exc:
+                transport="provider"
+                if callable(trace_cb):
+                    try: trace_cb("ARTWORK_OPEN_RETRY url=%r first=%r"%(url,str(first_exc)[:180]))
+                    except Exception: pass
+                response_ctx=provider_urlopen(req,timeout=max(2.0,min(float(timeout or 3.5),6.5)))
+            with response_ctx as response, open(temp,"wb") as handle:
                 ctype=(response.headers.get("Content-Type") or "").lower()
+                if callable(trace_cb):
+                    try: trace_cb("ARTWORK_HTTP url=%r transport=%s status=%r ctype=%r final=%r"%(url,transport,getattr(response,"status",None),ctype,getattr(response,"geturl",lambda:url)()))
+                    except Exception: pass
                 while True:
                     if cancel_event is not None and cancel_event.is_set():raise _ArtworkCancelled()
                     chunk=response.read(64*1024)
@@ -2060,7 +2871,7 @@ def _download_portal_artwork(value, profile, client, landscape=False, timeout=3.
             # image/octet-stream responses after actual image validation.
             if ext in (".gif",".bmp") or not ext:
                 if _PILImage is None:raise ValueError("unsupported provider artwork")
-                target=os.path.join(IMAGE_CACHE_DIR,digest+".png")
+                target=os.path.join(store_dir,digest+".png")
                 if not _persistent_write_ok(target): return None
                 with _PILImage.open(temp) as im:
                     im.seek(0)
@@ -2068,20 +2879,26 @@ def _download_portal_artwork(value, profile, client, landscape=False, timeout=3.
                     _persistent_write_require(target);im.save(target,"PNG",optimize=False)
                 os.unlink(temp);temp=None
             else:
-                target=os.path.join(IMAGE_CACHE_DIR,digest+ext)
+                target=os.path.join(store_dir,digest+ext)
                 if not _persistent_write_ok(target): return None
                 _persistent_write_require(target);os.replace(temp,target);temp=None
-            _cache_artwork_path(digest,target)
+            _cache_artwork_path(("b:" if landscape else "p:")+str(digest),target)
             if landscape and _PILImage is not None:
                 try:
                     with _PILImage.open(target) as im:
                         if float(im.width)/float(max(1,im.height))<1.25:return None
                 except Exception:return None
             _clear_artwork_failure(url)
+            if callable(trace_cb):
+                try: trace_cb("ARTWORK_OK url=%r path=%r bytes=%d ctype=%r"%(url,target,total,ctype))
+                except Exception: pass
             return target
         except _ArtworkCancelled:
             return None
-        except Exception:
+        except Exception as exc:
+            if callable(trace_cb):
+                try: trace_cb("ARTWORK_FAIL url=%r error=%r"%(url,str(exc)[:240]))
+                except Exception: pass
             _record_artwork_failure(url)
             return None
         finally:
@@ -2089,41 +2906,6 @@ def _download_portal_artwork(value, profile, client, landscape=False, timeout=3.
                 try:
                     if _persistent_write_ok(temp): os.unlink(temp)
                 except OSError:pass
-
-
-def _download_xtream_provider_pair(item, profile, client, media_type, cancel_event=None, force_info=True, timeout=4.0):
-    """Return (enriched_item, poster_local, backdrop_local) from Xtream provider art.
-
-    Works for native Xtream rows and M3U rows that carry Xtream stream identities.
-    Rich info is forced after a list-level URL miss so stale stream_icon values do
-    not suppress get_vod_info/get_series_info.
-    """
-    if not isinstance(item,dict) or client is None or not hasattr(client,"enrich_provider_artwork"):
-        return item,None,None
-    enriched=dict(item)
-    try:
-        enriched=client.enrich_provider_artwork(enriched,media_type,cancel_event,force=bool(force_info)) or enriched
-    except TypeError:
-        enriched=client.enrich_provider_artwork(enriched,media_type,cancel_event) or enriched
-    except Exception:
-        return enriched,None,None
-    poster=None;backdrop=None
-    try:
-        value=_image_url(enriched)
-        if value:
-            poster=_download_portal_artwork(value,profile,client,False,timeout,cancel_event,item=enriched)
-    except Exception as exc:optional_failure("ui.xtream_provider_poster",exc)
-    try:
-        value=_backdrop_url(enriched)
-        if value:
-            backdrop=_download_portal_artwork(value,profile,client,True,max(timeout,4.5),cancel_event,item=enriched)
-    except Exception as exc:optional_failure("ui.xtream_provider_backdrop",exc)
-    if poster or backdrop:
-        try:
-            snap=_portal_snapshot(enriched,media_type,poster_local=poster,backdrop_local=backdrop)
-            save_detail_snapshot(profile,media_type,enriched,snap)
-        except Exception as exc:optional_failure("ui.xtream_provider_snapshot",exc)
-    return enriched,poster,backdrop
 
 
 def _build_ambient_backdrop(source_path, target_path, size=(1920,1080)):
@@ -2202,12 +2984,12 @@ def _compose_information_text(item=None, fallback="", parent=None):
 
     meta_sources=[item if isinstance(item,dict) else {}, parent if isinstance(parent,dict) else {}]
     meta_specs=(
-        ("Year", ("year","release_year","first_air_date","release_date")),
-        ("Genre", ("genres","genre","category")),
-        ("Country", ("country","origin_country","production_country")),
-        ("Rating", ("vote_average","rating","imdb_rating")),
-        ("Director", ("director","directors")),
-        ("Cast", ("cast","actors","actor")),
+        (_("Year"), ("year","release_year","first_air_date","release_date")),
+        (_("Genre"), ("genres","genre","category")),
+        (_("Country"), ("country","origin_country","production_country")),
+        (_("Rating"), ("vote_average","rating","imdb_rating")),
+        (_("Director"), ("director","directors")),
+        (_("Cast"), ("cast","actors","actor")),
     )
     used=set()
     meta_lines=[]
@@ -2224,7 +3006,7 @@ def _compose_information_text(item=None, fallback="", parent=None):
         if lines:
             lines.append("")
         lines.extend(meta_lines)
-    return "\n".join(lines).strip() or "No information available."
+    return "\n".join(lines).strip() or _("No programme description")
 
 
 
@@ -2423,7 +3205,7 @@ def _build_integrated_backdrop(source_path, target_path, size=(1620,620)):
             scale=max(float(tw)/max(1,image.width),float(th)/max(1,image.height))
             nw=max(1,int(round(image.width*scale)));nh=max(1,int(round(image.height*scale)))
             image=image.resize((nw,nh),resampling)
-            left=max(0,(nw-tw)//2);top=max(0,int((nh-th)*0.31))
+            left=max(0,(nw-tw)//2);top=max(0,int((nh-th)*0.12))
             image=image.crop((left,top,left+tw,top+th))
 
             left_fade=max(165,int(tw*.14));right_fade=max(260,int(tw*.20))
@@ -2467,101 +3249,11 @@ def _build_integrated_backdrop(source_path, target_path, size=(1620,620)):
         return None
 
 
-def _build_home_hero(source_path,target_path,size=(1920,1080)):
-    try: os.makedirs(os.path.dirname(target_path) or HOME_RUNTIME_DIR, exist_ok=True)
-    except Exception: return None
-    if not _persistent_write_ok(THUMB_CACHE_DIR): return None
-    """Build the Home hero as a TOP cinematic backdrop, not a wallpaper.
-
-    The TMDB landscape art owns only the upper hero zone.  It stays crisp at the
-    top, is darkened beneath the copy, and then dissolves completely into the
-    adaptive Ultra Stalker ambient background around the menu row.  The alpha
-    reaches true zero, so there is no horizontal cut line and no artwork remains
-    behind Continue/Recent.
-    """
-    if _PILImage is None or not source_path or not os.path.isfile(source_path):return None
-    temp=target_path+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
-    try:
-        tw,th=map(int,size);rs=getattr(getattr(_PILImage,"Resampling",_PILImage),"LANCZOS",1)
-        with _PILImage.open(source_path) as image:
-            try:image=_PILImageOps.exif_transpose(image)
-            except Exception as exc:optional_failure("ui.silent_guard",exc)
-            image=image.convert("RGB")
-            if float(image.width)/max(1.0,float(image.height))<1.35:return None
-
-            # Cover the full 16:9 canvas first so no picture edge can ever show.
-            scale=max(float(tw)/max(1,image.width),float(th)/max(1,image.height))
-            nw=max(tw,int(round(image.width*scale)));nh=max(th,int(round(image.height*scale)))
-            image=image.resize((nw,nh),rs)
-            left=max(0,(nw-tw)//2);top=max(0,(nh-th)//2)
-            image=image.crop((left,top,left+tw,top+th))
-
-            # Keep the cinematic picture natural but restrained.  The adaptive
-            # ambient layer underneath supplies the page colour below the hero.
-            grade=_PILImage.new("RGBA",(tw,th),(2,7,12,38))
-            image=_PILImage.alpha_composite(image.convert("RGBA"),grade).convert("RGB")
-
-            # Text-side scrim is part of the hero itself, replacing the old fixed
-            # overlay asset and therefore avoiding its hard lower edge.
-            scrim=_PILImage.new("RGBA",(tw,th),(0,0,0,0));sd=ImageDraw.Draw(scrim) if ImageDraw is not None else None
-            if sd is not None:
-                # Strongest behind the left-side title, almost absent on the right.
-                for x in range(0,min(tw,1040),16):
-                    q=x/1040.0
-                    a=int(118*((1.0-q)**1.55))
-                    sd.rectangle((x,0,min(tw,x+16),470),fill=(1,6,10,a))
-            if _PILImageFilter is not None:
-                try:scrim=scrim.filter(_PILImageFilter.GaussianBlur(radius=22))
-                except Exception as exc:optional_failure("ui.silent_guard",exc)
-            image=_PILImage.alpha_composite(image.convert("RGBA"),scrim).convert("RGB")
-
-            # Hero alpha: fully cinematic through the upper area, then a long
-            # feather that reaches COMPLETE transparency around the menu/icons.
-            # This is what makes the art feel poured into the normal background.
-            vm=_PILImage.new("L",(1,th));vvals=[]
-            fade_start=330.0
-            fade_end=610.0
-            for y in range(th):
-                if y<=fade_start:
-                    a=255
-                elif y>=fade_end:
-                    a=0
-                else:
-                    t=(y-fade_start)/(fade_end-fade_start)
-                    # Smoothstep reversed, with a slightly longer soft tail.
-                    s=t*t*(3.0-2.0*t)
-                    a=int(255*(1.0-s))
-                vvals.append(max(0,min(255,a)))
-            vm.putdata(vvals);vm=vm.resize((tw,th))
-
-            # Side feathering is subtle.  We do NOT reveal picture borders; it only
-            # reduces contrast where the image meets the dark page atmosphere.
-            hm=_PILImage.new("L",(tw,1));hvals=[]
-            for x in range(tw):
-                a=255
-                if x<70:
-                    t=x/70.0;a=int(224+31*t)
-                elif x>1870:
-                    t=max(0.0,(tw-1-x)/49.0);a=int(224+31*t)
-                hvals.append(max(0,min(255,a)))
-            hm.putdata(hvals);hm=hm.resize((tw,th))
-            alpha=_PILImageChops.multiply(hm,vm) if _PILImageChops is not None else vm
-            if _PILImageFilter is not None:
-                try:alpha=alpha.filter(_PILImageFilter.GaussianBlur(radius=12))
-                except Exception as exc:optional_failure("ui.silent_guard",exc)
-
-            rgba=image.convert("RGBA");rgba.putalpha(alpha);_persistent_write_require(temp);rgba.save(temp,"PNG",optimize=False)
-        _persistent_write_require(target_path);os.replace(temp,target_path);return target_path if os.path.getsize(target_path)>100 else None
-    except Exception:
-        try:
-            if os.path.exists(temp) and _persistent_write_ok(temp):os.unlink(temp)
-        except Exception as exc:optional_failure("ui.silent_guard",exc)
-        return None
-
 def _serialized_artwork_builder(func):
     def wrapped(source_path, target_path, *args, **kwargs):
         with _artwork_target_lock(target_path):
-            return func(source_path, target_path, *args, **kwargs)
+            with image_work(getattr(func,"__name__","artwork")):
+                return func(source_path, target_path, *args, **kwargs)
     wrapped.__name__ = getattr(func, "__name__", "artwork_builder")
     return wrapped
 
@@ -2572,28 +3264,18 @@ _build_thumbnail = _serialized_artwork_builder(_build_thumbnail)
 _build_ambient_backdrop = _serialized_artwork_builder(_build_ambient_backdrop)
 _build_cinematic_backdrop = _serialized_artwork_builder(_build_cinematic_backdrop)
 _build_integrated_backdrop = _serialized_artwork_builder(_build_integrated_backdrop)
-_build_home_hero = _serialized_artwork_builder(_build_home_hero)
 
 # Home artwork generation is memory-heavy on Enigma2 receivers.  Serialize all
 # Home-derived Pillow work so a hero, ambient, glass and focus render can never
 # allocate large RGBA buffers at the same time.
-_home_build_home_hero = _build_home_hero
-_home_build_home_adaptive_focus = _build_home_adaptive_focus
-_home_build_home_mood_assets = _build_home_mood_assets
-
-def _build_home_hero_safe(source_path, target_path, size=(1920,1080)):
-    with _HOME_VISUAL_BUILD_LOCK:
-        return _home_build_home_hero(source_path, target_path, size)
-
+# R64: legacy Hero-dependent application-chrome writers are permanently disabled.
+# Poster/content adaptive builders remain untouched elsewhere.
 def _build_home_adaptive_focus_safe(source_path, cache_key):
-    with _HOME_VISUAL_BUILD_LOCK:
-        return _home_build_home_adaptive_focus(source_path, cache_key)
+    return {}
 
 def _build_home_mood_assets_safe(source_path, cache_key):
-    with _HOME_VISUAL_BUILD_LOCK:
-        return _home_build_home_mood_assets(source_path, cache_key)
+    return {}
 
-_build_home_hero = _build_home_hero_safe
 _build_home_adaptive_focus = _build_home_adaptive_focus_safe
 _build_home_mood_assets = _build_home_mood_assets_safe
 
@@ -2624,12 +3306,10 @@ def _home_cached_art(item, profile, size, placeholder, media_type=""):
             url=_source_art_url(value,profile or {},item) or value
             url=_normalize_provider_image_url(url) or url
             source=_cached_live_picon_path(url,profile or {},item)
-            if source and os.path.isfile(source):
-                try:
-                    from .services.player_visuals import _prepare_live_picon
-                    return _prepare_live_picon(source,(220,132)) or source
-                except Exception:
-                    return source
+            # Home9 is a strict network-cache consumer: return the cached source only.
+            # The Home screen performs any 220x132 aspect-safe local fit on its
+            # shared image worker, never on the GUI thread and never via network.
+            if source and os.path.isfile(source):return source
             return asset(placeholder)
         media="series" if mtype in ("series","episode") else "vod"
         art_item=dict(item)
@@ -2677,19 +3357,13 @@ def _home_prepare_art(item, profile, client, size, placeholder, media_type=""):
             url=_normalize_provider_image_url(url) or url
             source=_cached_live_picon_path(url,profile or {},item)
             if source and os.path.isfile(source):
-                try:
-                    from .services.player_visuals import _prepare_live_picon
-                    return _prepare_live_picon(source,(220,132)) or source
-                except Exception:
-                    return source
+                fitted=_fit_live_picon_canvas(source,PERSISTENT_GENERATED_DIR,(220,132))
+                return fitted or source
             # Cache miss: preserve the existing Home behaviour as fallback only.
             source=_download_portal_artwork(value,profile,client,False,timeout=3.5,item=item)
             if source:
-                try:
-                    from .services.player_visuals import _prepare_live_picon
-                    return _prepare_live_picon(source,(220,132)) or source
-                except Exception:
-                    return source
+                fitted=_fit_live_picon_canvas(source,PERSISTENT_GENERATED_DIR,(220,132))
+                return fitted or source
         except Exception as exc:
             optional_failure("ui.home_recent_live_picon",exc)
         return asset(placeholder)
@@ -2741,17 +3415,24 @@ def _player_payload(item, profile=None, fallback=None, media_type=None):
     forget where playback stopped.
     """
     data = {}
-    # XStreamity-style service handoff: every player remembers the receiver
-    # service that was active before Ultra Stalker opened. EXIT can then stop
-    # IPTV and hand navigation back to Enigma2 cleanly.
-    data["_return_service_ref_string"]=_plugin_original_service_string()
     if isinstance(fallback, dict):
         data.update(fallback)
     if isinstance(item, dict):
         data.update(item)
+    if media_type == "episode" and isinstance(fallback, dict):
+        # Keep the parent-series title for artwork, subtitles and episode identity.
+        if not data.get("_series_title"):
+            data["_series_title"]=str(fallback.get("name") or fallback.get("title") or fallback.get("_raw_name") or "")
+    # Receiver service handoff: pin the service captured at the true
+    # plugin boundary AFTER merging item/fallback payloads. Old history or
+    # zap rows may carry a stale/blank private key; they must never override the
+    # current session return service.
+    data["_return_service_ref_string"]=_plugin_original_service_string()
     if isinstance(profile, dict):
         data["_portal"] = str(profile.get("portal") or "")
         data["_mac"] = str(profile.get("mac") or "")
+        data["_server_name"] = str(profile.get("name") or "")
+        data["_source_type"] = str(profile.get("source_type") or data.get("_source_type") or "")
         data["_allow_http_fallback"] = bool(profile.get("allow_http_fallback",False))
         data["_tls_mode"] = str(profile.get("tls_mode") or "auto")
         data["_device_profile"] = str(profile.get("device_profile") or "auto")
@@ -2803,9 +3484,102 @@ def _player_payload(item, profile=None, fallback=None, media_type=None):
                 data["_resume_duration"] = duration
         except Exception as exc:
             optional_failure("ui", exc)
-    # Player poster also follows the external-only artwork rule.  Never read
-    # portal cover/screenshot fields here.  Prefer the verified HDD snapshot
-    # for the exact item, then the parent series snapshot for episodes.
+    # Player title-logo handoff is authority-only.  The Player never selects a
+    # Player-sized cache independently; it consumes the current screen or the
+    # same 420x144 Cinematic Ultra authority for the locked identity.
+    try:
+        logo_owner=(fallback if media_type=="episode" and isinstance(fallback,dict) else item) if isinstance(item,dict) else (fallback or {})
+        if not isinstance(logo_owner,dict):logo_owner={}
+        from .title_logo_ultra import ultra_title_logo_cached, ultra_title_logo_identity_id
+        # Home Recent stores a compact history row. Rehydrate only already-known
+        # identity/policy metadata from the persistent HDD snapshot before the
+        # Player asks for its title-logo authority. This is HDD-only and avoids
+        # the historical first-open blank / second-open hit.
+        try:
+            logo_media="series" if media_type in ("series","episode") else (media_type or "vod")
+            logo_snap={}
+            if media_type=="episode":
+                series_ref={}
+                if isinstance(fallback,dict):
+                    series_ref=dict(fallback)
+                elif isinstance(logo_owner,dict):
+                    series_ref=dict(logo_owner)
+                    sid=series_ref.get("_series_id") or series_ref.get("series_id") or series_ref.get("series") or series_ref.get("parent_id")
+                    if sid not in (None,""):series_ref["series_id"]=sid
+                    stitle=series_ref.get("_series_title") or series_ref.get("series_title") or series_ref.get("series_name")
+                    if stitle:series_ref["name"]=stitle;series_ref["title"]=stitle
+                if series_ref:
+                    logo_snap=load_artwork_v2_manifest(profile or {},"series",series_ref) or load_detail_snapshot(profile or {},"series",series_ref) or {}
+            if not logo_snap:
+                logo_snap=load_artwork_v2_manifest(profile or {},logo_media,logo_owner) or load_detail_snapshot(profile or {},logo_media,logo_owner) or {}
+            if isinstance(logo_snap,dict):
+                snap_tmdb=logo_snap.get("tmdb_id")
+                if snap_tmdb not in (None,""):
+                    logo_owner.setdefault("tmdb_id",snap_tmdb);logo_owner.setdefault("_locked_tmdb_id",snap_tmdb)
+                for key in ("original_language","origin_country","countries","production_countries","original_title","original_name","logo_url","logo_language"):
+                    value=logo_snap.get(key)
+                    if value not in (None,"",[],{}) and logo_owner.get(key) in (None,"",[],{}):logo_owner[key]=value
+        except Exception as exc:optional_failure("ui.player_title_logo_recent_hdd",exc)
+        logo_title=str(logo_owner.get("name") or logo_owner.get("title") or data.get("_series_title") or data.get("name") or data.get("title") or "")
+        logo_id=ultra_title_logo_identity_id(logo_owner,logo_owner)
+        authority=""
+        for candidate in (logo_owner.get("_player_title_logo_cinematic_source"),):
+            try:
+                candidate=str(candidate or "")
+                if candidate and os.path.isfile(candidate) and os.path.getsize(candidate)>256:authority=candidate;break
+            except Exception:pass
+        if not authority:
+            authority=ultra_title_logo_cached(media_type,logo_owner,logo_owner,(420,144),logo_title)
+        if authority:
+            data["_player_title_logo_cinematic_source"]=authority
+            data["_player_title_logo_title"]=logo_title
+            history=data.get("_history_item")
+            if isinstance(history,dict):history["_player_title_logo_cinematic_source"]=authority
+        if logo_id not in (None,""):
+            data["_player_title_logo_tmdb_id"]=logo_id
+            data["_locked_tmdb_id"]=logo_id
+            history=data.get("_history_item")
+            if isinstance(history,dict):
+                history["_player_title_logo_tmdb_id"]=logo_id;history["_locked_tmdb_id"]=logo_id
+    except Exception as exc:optional_failure("ui.player_title_logo_handoff",exc)
+
+    # R37 player poster identity lock.  Artwork slots and history rows can live
+    # longer than the item that first painted them, so a local poster is trusted
+    # only inside the same portal-scoped logical content identity.  Episodes use
+    # their parent-series identity because the Player intentionally shows the
+    # series poster.
+    expected_poster_identity=""
+    try:
+        from .persistent_cache import content_cache_key
+        identity_media="series" if media_type=="episode" else (media_type or "vod")
+        identity_item=(fallback if media_type=="episode" and isinstance(fallback,dict) else item)
+        if isinstance(identity_item,dict):
+            expected_poster_identity=str(content_cache_key(profile or {},identity_media,identity_item) or "")
+        handed_identity=str(data.get("_player_poster_identity") or "")
+        if expected_poster_identity and handed_identity and handed_identity!=expected_poster_identity:
+            for _k in ("_player_poster","_ultra_poster_source","_adaptive_source_local","_cin_provider_poster_local"):
+                data.pop(_k,None)
+            data.pop("_player_poster_identity",None)
+    except Exception as exc:
+        optional_failure("ui.player_poster_identity_prepare",exc)
+
+    # First honor an already-verified local poster handed off by the current
+    # Grid/Cinematic/Details screen. Playback must not start a parallel artwork
+    # identity when the exact poster is already resident on HDD.
+    try:
+        for local_key in ("_player_poster","_ultra_poster_source","_adaptive_source_local","_cin_provider_poster_local","poster_local"):
+            candidate=str(data.get(local_key) or "")
+            if candidate and os.path.isfile(candidate) and os.path.getsize(candidate)>100:
+                data["_player_poster"]=candidate;break
+        for local_key in ("_backdrop_source_local","_cin_provider_backdrop_local"):
+            candidate=str(data.get(local_key) or "")
+            if candidate and os.path.isfile(candidate) and os.path.getsize(candidate)>100:
+                data["_backdrop_source_local"]=candidate;break
+    except Exception as exc:
+        optional_failure("ui.player_local_handoff",exc)
+
+    # Then consult the canonical external HDD snapshot. Episodes prefer the
+    # parent-series poster; a valid current-screen handoff always wins.
     try:
         art_item = dict(item) if isinstance(item,dict) else dict(data)
         if media_type=="episode":
@@ -2813,74 +3587,99 @@ def _player_payload(item, profile=None, fallback=None, media_type=None):
             parent_title=art_item.get("_series_title")
             if parent_id not in (None,""): art_item["series_id"]=parent_id
             if parent_title: art_item["name"]=parent_title; art_item["title"]=parent_title
-        # Episodes must use the canonical parent-series poster first.  The
-        # episode cache may contain an older portal/episode image, which made
-        # the player InfoBar disagree with the information overlay.
         if media_type=="episode":
-            snap = None
+            snap=None
             if isinstance(fallback,dict):
-                snap = load_artwork_v2_manifest(profile or {}, "series", fallback)
+                snap=load_artwork_v2_manifest(profile or {},"series",fallback)
                 if not isinstance(snap,dict) or not snap.get("poster_local"):
-                    snap = load_detail_snapshot(profile or {}, "series", fallback)
+                    snap=load_detail_snapshot(profile or {},"series",fallback)
             if not isinstance(snap,dict) or not snap.get("poster_local"):
-                snap = load_artwork_v2_manifest(profile or {}, "series", art_item)
+                snap=load_artwork_v2_manifest(profile or {},"series",art_item)
             if not isinstance(snap,dict) or not snap.get("poster_local"):
-                snap = load_detail_snapshot(profile or {}, "series", art_item)
-            # Only fall back to episode artwork when no parent-series poster
-            # exists at all.
+                snap=load_detail_snapshot(profile or {},"series",art_item)
             if not isinstance(snap,dict) or not snap.get("poster_local"):
-                snap = load_artwork_v2_manifest(profile or {}, "episode", art_item)
+                snap=load_artwork_v2_manifest(profile or {},"episode",art_item)
             if not isinstance(snap,dict) or not snap.get("poster_local"):
-                snap = load_detail_snapshot(profile or {}, "episode", art_item)
+                snap=load_detail_snapshot(profile or {},"episode",art_item)
         else:
-            snap = load_artwork_v2_manifest(profile or {}, media_type or "vod", art_item)
+            snap=load_artwork_v2_manifest(profile or {},media_type or "vod",art_item)
             if not isinstance(snap,dict) or not snap.get("poster_local"):
-                snap = load_detail_snapshot(profile or {}, media_type or "vod", art_item)
-        if isinstance(snap,dict) and str(snap.get("identity_source") or "")!="portal_payload":
+                snap=load_detail_snapshot(profile or {},media_type or "vod",art_item)
+
+        # release player poster persistence bridge.  The browser/grid may carry
+        # only the locked external identity while the item-keyed pointer was
+        # created by an earlier screen/portal representation.  Fall back to the
+        # global persistent TMDb/IMDb library before allowing Player to use a
+        # generated letter logo.  HDD reads only: no TMDb/provider request here.
+        if not isinstance(snap,dict) or not snap.get("poster_local"):
+            lookup_media="series" if media_type in ("series","episode") else (media_type or "vod")
+            locked_tmdb=(art_item.get("_locked_tmdb_id") or art_item.get("tmdb_id") or art_item.get("tmdbid") or data.get("_locked_tmdb_id") or data.get("tmdb_id") or data.get("tmdbid"))
+            locked_imdb=(art_item.get("imdb_id") or art_item.get("imdb") or data.get("imdb_id") or data.get("imdb"))
+            if locked_tmdb not in (None,""):
+                try:snap=load_detail_snapshot_by_tmdb(lookup_media,locked_tmdb) or {}
+                except Exception as exc:optional_failure("ui.player_tmdb_poster_lookup",exc);snap={}
+            if (not isinstance(snap,dict) or not snap.get("poster_local")) and locked_imdb:
+                try:snap=load_detail_snapshot_by_imdb(locked_imdb) or {}
+                except Exception as exc:optional_failure("ui.player_imdb_poster_lookup",exc);snap={}
+            if not isinstance(snap,dict) or not snap.get("poster_local"):
+                try:snap=load_shared_detail_snapshot(profile or {},lookup_media,art_item) or {}
+                except Exception as exc:optional_failure("ui.player_shared_poster_lookup",exc);snap={}
+        if isinstance(snap,dict):
+            # Exact item-keyed persistent artwork is sufficient for Player visual
+            # handoff. Opening Details is never a prerequisite for a movie poster.
             candidate=str(snap.get("poster_local") or "")
+            # R37: an exact item/TMDb snapshot has stronger identity than any
+            # recycled on-screen slot.  When it exists it always replaces the
+            # handed poster instead of allowing stale pixels to win forever.
             if candidate and os.path.isfile(candidate) and os.path.getsize(candidate)>100:
-                data["_player_poster"] = candidate
-                # Persist the canonical HDD poster with history on the next save.
-                # This makes subsequent Home launches immediate and gives the
-                # player its adaptive palette before any network/background work.
+                data["_player_poster"]=candidate
+                if expected_poster_identity:data["_player_poster_identity"]=expected_poster_identity
+            final_poster=str(data.get("_player_poster") or "")
+            if final_poster and os.path.isfile(final_poster):
+                if expected_poster_identity:data["_player_poster_identity"]=expected_poster_identity
                 history=data.get("_history_item")
                 if isinstance(history,dict):
-                    history["_player_poster"]=candidate
-                    history["_adaptive_source_local"]=candidate
+                    history["_player_poster"]=final_poster;history["_adaptive_source_local"]=final_poster
+                    if expected_poster_identity:history["_player_poster_identity"]=expected_poster_identity
             backdrop=str(snap.get("display_backdrop_local") or snap.get("backdrop_local") or "")
-            if backdrop and os.path.isfile(backdrop) and os.path.getsize(backdrop)>100:
+            current_backdrop=str(data.get("_backdrop_source_local") or "")
+            if (not (current_backdrop and os.path.isfile(current_backdrop))) and backdrop and os.path.isfile(backdrop) and os.path.getsize(backdrop)>100:
                 data["_backdrop_source_local"]=backdrop
                 history=data.get("_history_item")
                 if isinstance(history,dict):history["_backdrop_source_local"]=backdrop
     except Exception as exc:
-        optional_failure("ui.player_external_poster", exc)
-    return data
-    try:
-        if value.startswith("//"):
-            scheme = urllib.parse.urlsplit((profile or {}).get("portal", "http://")).scheme or "http"
-            value = scheme + ":" + value
-        elif not value.startswith(("http://", "https://")):
-            value = urllib.parse.urljoin((profile or {}).get("portal", "").rstrip("/") + "/", value.lstrip("/"))
-        if value.startswith(("http://", "https://")):
-            value = _optimized_artwork_url(value, False)
-            data["_player_poster_url"] = value
-            digest = hashlib.sha1(value.encode("utf-8", "ignore")).hexdigest()
-            for ext in (".png", ".jpg", ".jpeg", ".webp"):
-                candidate = os.path.join(IMAGE_CACHE_DIR, digest + ext)
-                if os.path.isfile(candidate) and os.path.getsize(candidate) > 100:
-                    data["_player_poster"] = candidate
-                    break
-    except Exception as exc:
-        optional_failure("ui", exc)
-    return data
+        optional_failure("ui.player_external_poster",exc)
 
+    # Last HDD-only bridge for provider-backed content. This fixes the old dead
+    # fallback code that sat after `return data` and therefore never executed.
+    # Resolve the browser's exact URL digest, but never perform network I/O here.
+    try:
+        current=str(data.get("_player_poster") or "")
+        if not (current and os.path.isfile(current) and os.path.getsize(current)>100):
+            raw=str(data.get("_cin_provider_poster_url") or data.get("_visible_provider_art_url") or (_image_url(item) if isinstance(item,dict) else "") or "")
+            value=_source_art_url(raw,profile or {},item if isinstance(item,dict) else data) if raw else None
+            if value:
+                value=_optimized_artwork_url(value,False)
+                data["_player_poster_url"]=value
+                digest=hashlib.sha1(value.encode("utf-8","ignore")).hexdigest()
+                candidate=_find_original_artwork(digest)
+                if candidate and os.path.isfile(candidate) and os.path.getsize(candidate)>100:
+                    data["_player_poster"]=candidate
+                    if expected_poster_identity:data["_player_poster_identity"]=expected_poster_identity
+                    history=data.get("_history_item")
+                    if isinstance(history,dict):
+                        history["_player_poster"]=candidate;history["_adaptive_source_local"]=candidate
+                        if expected_poster_identity:history["_player_poster_identity"]=expected_poster_identity
+    except Exception as exc:
+        optional_failure("ui.player_cached_provider_poster",exc)
+    return data
 
 
 
 
 from .ui_skin_templates import (
-    MAIN_SKIN, BROWSER_SKIN, POSTER_GRID_SKIN, LIVE_GRID_SKIN, DETAIL_SKIN,
-    SERIES_EPISODES_SKIN, HOME_SKIN, DIAGNOSTICS_SKIN, WIZARD_SKIN,
+    MAIN_SKIN, BROWSER_SKIN, POSTER_GRID_SKIN, POSTER_GRID_V2_SKIN, LIVE_GRID_SKIN, DETAIL_SKIN,
+    SERIES_EPISODES_SKIN, HOME_SKIN, DIAGNOSTICS_SKIN, WIZARD_SKIN, CINEMATIC_GLOBAL_SKIN, BACKDROP_GRID_SKIN, BACKDROP_GRID2_SKIN, SEARCH_SKIN,
 )
 
 _NEUTRAL_UTILITY_GLASS_CACHE = None
@@ -2890,10 +3689,10 @@ def _neutral_utility_glass():
     if isinstance(_NEUTRAL_UTILITY_GLASS_CACHE,dict):
         return dict(_NEUTRAL_UTILITY_GLASS_CACHE)
     out={
-        "settings_row":asset("us_settings_glass_row.png"),
-        "settings_selected":asset("us_settings_glass_row_selected.png"),
-        "utility_row":asset("us_utility_glass_row.png"),
-        "utility_selected":asset("us_utility_glass_row_selected.png"),
+        "settings_row":asset("fixed_master_r63/utility_row.png"),
+        "settings_selected":asset("fixed_master_r63/utility_row_selected.png"),
+        "utility_row":asset("fixed_master_r63/utility_row.png"),
+        "utility_selected":asset("fixed_master_r63/utility_row_selected.png"),
         "side":asset("us_utility_side_card_660.png"),
     }
     out["row"]=out["utility_row"]
@@ -3012,20 +3811,59 @@ def _scale_skin(xml):
     def pair(match):
         return '%s="%d,%d"' % (match.group(1), round(int(match.group(2))*sx), round(int(match.group(3))*sy))
     xml = re.sub(r'(position|size)="(\d+),(\d+)"', pair, xml)
-    xml = re.sub(r'font="([^;]+);(\d+)"', lambda m: 'font="%s;%d"' % (m.group(1), max(14, round(int(m.group(2))*sy))), xml)
+    # Preserve 1px compatibility widgets. Only real text receives desktop scaling.
+    def desktop_font(match):
+        base=int(match.group(2))
+        if base < 12:return match.group(0)
+        return 'font="%s;%d"' % (match.group(1), max(12, round(base*sy)))
+    xml = re.sub(r'font="([^;]+);(\d+)"', desktop_font, xml)
     return xml
 
-MAIN_SKIN = _scale_skin(MAIN_SKIN)
-BROWSER_SKIN = _scale_skin(BROWSER_SKIN)
-POSTER_GRID_SKIN = _scale_skin(POSTER_GRID_SKIN)
-LIVE_GRID_SKIN = _scale_skin(LIVE_GRID_SKIN)
-DETAIL_SKIN = _scale_skin(DETAIL_SKIN)
-SERIES_EPISODES_SKIN = _scale_skin(SERIES_EPISODES_SKIN)
-HOME_SKIN = _scale_skin(HOME_SKIN)
-DIAGNOSTICS_SKIN = _scale_skin(DIAGNOSTICS_SKIN)
-from .ui_screens_diagnostics import DiagnosticsScreen
+_FONT_SCALE_FACTORS={"normal":1.0,"large":1.12,"larger":1.22,"xlarge":1.32}
+def _apply_user_font_scale(xml):
+    """Apply the global readability preference to real text only.
+
+    Geometry is deliberately untouched; growth is capped at +10 px so provider
+    titles still fit their authored boxes and existing adaptive fitters remain
+    the final authority for unusually long strings.
+    """
+    try:mode=str(load_settings().get("font_scale") or "normal").lower()
+    except Exception:mode="normal"
+    factor=float(_FONT_SCALE_FACTORS.get(mode,1.0))
+    if factor <= 1.0:return xml
+    def repl_font(match):
+        base=int(match.group(2))
+        if base < 12:return match.group(0)
+        size=max(base,min(base+10,int(round(base*factor))))
+        return 'font="%s;%d"' % (match.group(1),size)
+    return re.sub(r'font="([^;]+);(\d+)"',repl_font,xml)
+
+def _prepare_runtime_skin(xml):
+    return _apply_user_font_scale(_scale_skin(xml))
+
+MAIN_SKIN = _prepare_runtime_skin(MAIN_SKIN)
+BROWSER_SKIN = _prepare_runtime_skin(BROWSER_SKIN)
+POSTER_GRID_SKIN = _prepare_runtime_skin(POSTER_GRID_SKIN)
+LIVE_GRID_SKIN = _prepare_runtime_skin(LIVE_GRID_SKIN)
+DETAIL_SKIN = _prepare_runtime_skin(DETAIL_SKIN)
+SERIES_EPISODES_SKIN = _prepare_runtime_skin(SERIES_EPISODES_SKIN)
+HOME_SKIN = _prepare_runtime_skin(HOME_SKIN)
+CINEMATIC_GLOBAL_SKIN = _prepare_runtime_skin(CINEMATIC_GLOBAL_SKIN)
+DIAGNOSTICS_SKIN = _prepare_runtime_skin(DIAGNOSTICS_SKIN)
+def DiagnosticsScreen(session, *args, **kwargs):
+    # Diagnostics pulls database/endurance/backup state; none is needed for the
+    # normal portal/home path. Session.open accepts this callable factory just
+    # like the existing lazy Player factory.
+    from .ui_screens_diagnostics import DiagnosticsScreen as _RealDiagnosticsScreen
+    # The callable factory is not the Screen instance Enigma2 renders.  Bind the
+    # already scaled/prepared runtime skin to the extracted real class as well,
+    # otherwise its module-level `skin = ""` produces a fully populated black
+    # screen.
+    try:_RealDiagnosticsScreen.skin = DIAGNOSTICS_SKIN
+    except Exception:pass
+    return _RealDiagnosticsScreen(session, *args, **kwargs)
 DiagnosticsScreen.skin = DIAGNOSTICS_SKIN
-WIZARD_SKIN = _scale_skin(WIZARD_SKIN)
+WIZARD_SKIN = _prepare_runtime_skin(WIZARD_SKIN)
 
 
 from .ui_transition import TransitionMixin
@@ -3046,7 +3884,7 @@ from .ui_image_loader import (
 )
 _configure_image_loader(
     LOG,
-    IMAGE_CACHE_DIR,
+    SOURCE_POSTER_CACHE_DIR,
     _ArtworkCancelled,
     _IMAGE_EXECUTOR,
     _artwork_attempt_allowed,
@@ -3090,40 +3928,84 @@ from .ui_screens_browser import (
 
 
 
-from .ui_screens_wizard import (
-    configure_wizard_screen as _configure_wizard_screen,
-    FirstRunWizardScreen,
-)
-_configure_wizard_screen(
-    PortalHomeScreen,
-    PortalListScreen,
-    WIZARD_DONE_FILE,
-    WIZARD_SKIN,
-    _client_from_profile,
-    _friendly_portal_error,
-    _looks_like_m3u_url,
-    _probe_m3u_url,
-    _validate_profile_client,
-)
+_WIZARD_SCREEN_CLASS = None
+def _ensure_wizard_screen():
+    global _WIZARD_SCREEN_CLASS
+    if _WIZARD_SCREEN_CLASS is None:
+        from .ui_screens_wizard import configure_wizard_screen as _configure_wizard_screen_lazy, FirstRunWizardScreen as _RealFirstRunWizardScreen
+        _configure_wizard_screen_lazy(
+            PortalHomeScreen,
+            PortalListScreen,
+            WIZARD_DONE_FILE,
+            WIZARD_SKIN,
+            _client_from_profile,
+            _friendly_portal_error,
+            _looks_like_m3u_url,
+            _probe_m3u_url,
+            _validate_profile_client,
+        )
+        _WIZARD_SCREEN_CLASS = _RealFirstRunWizardScreen
+    return _WIZARD_SCREEN_CLASS
+
+def FirstRunWizardScreen(session, *args, **kwargs):
+    return _ensure_wizard_screen()(session, *args, **kwargs)
 
 
 
 
 
 def _settings_popup_source():
+    """R64: Settings/Portal popups use the frozen application source only."""
     try:
-        with open(HOME_HERO_FILE,"r",encoding="utf-8") as h:
-            state=json.load(h)
-        hero=state.get("hero") if isinstance(state,dict) else {}
-    except Exception:
-        hero={}
-    for key in ("display_backdrop_local","backdrop_local","prepared"):
-        src=str((hero or {}).get(key) or "")
-        try:
-            if src and os.path.isfile(src) and os.path.getsize(src)>4096:return src
-        except Exception as exc:optional_failure("ui.settings_popup_source",exc)
-    fallback=asset("nova_browser_bg.png")
+        from .ui_fixed_adaptive import fixed_adaptive_source
+        src=str(fixed_adaptive_source() or "")
+        if src and os.path.isfile(src) and os.path.getsize(src)>4096:
+            return src
+    except Exception as exc:
+        optional_failure("ui.settings_fixed_popup_source",exc)
+    fallback=asset("category_palestine_static_1920x1080.jpg")
     return fallback if fallback and os.path.isfile(fallback) else None
+
+def _settings_popup_backdrop(source_path):
+    """Return a cached blurred/dimmed copy of the current Home hero for Settings overlays.
+
+    This is deliberately disk-only: opening a Settings popup must never trigger a
+    network request or rebuild the Home hero.
+    """
+    if not source_path or not os.path.isfile(source_path) or _PILImage is None:
+        return source_path
+    if not _persistent_write_ok(THUMB_CACHE_DIR):
+        return source_path
+    try:
+        try: stamp=os.path.getmtime(source_path)
+        except Exception: stamp=0
+        sig=hashlib.sha1((str(source_path)+"|"+str(stamp)+"|settings-popup-blur-v1").encode("utf-8","ignore")).hexdigest()[:18]
+        target=os.path.join(THUMB_CACHE_DIR,"settings_popup_blur_%s.jpg"%sig)
+        if _valid_cache_file(target):
+            return target
+        temp=target+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
+        with _PILImage.open(source_path) as image:
+            try:image=_PILImageOps.exif_transpose(image)
+            except Exception as exc:optional_failure("ui.settings_popup_exif",exc)
+            image=image.convert("RGB")
+            tw,th=1920,1080
+            scale=max(float(tw)/max(1,image.width),float(th)/max(1,image.height))
+            nw=max(tw,int(round(image.width*scale)));nh=max(th,int(round(image.height*scale)))
+            res=getattr(getattr(_PILImage,"Resampling",_PILImage),"LANCZOS",1)
+            image=image.resize((nw,nh),res)
+            left=max(0,(nw-tw)//2);top=max(0,(nh-th)//2)
+            image=image.crop((left,top,left+tw,top+th))
+            if _PILImageFilter is not None:
+                image=image.filter(_PILImageFilter.GaussianBlur(radius=15))
+            # Keep the hero recognisable while pushing it behind the modal card.
+            shade=_PILImage.new("RGBA",(tw,th),(1,5,10,118))
+            image=_PILImage.alpha_composite(image.convert("RGBA"),shade).convert("RGB")
+            _persistent_write_require(temp);image.save(temp,"JPEG",quality=90,optimize=True)
+        _persistent_write_require(target);os.replace(temp,target)
+        return target
+    except Exception as exc:
+        optional_failure("ui.settings_popup_backdrop",exc)
+        return source_path
 
 def _build_settings_popup_chrome(source_path, cache_key):
     """Adaptive 3D glass for Settings dialogs.
@@ -3305,14 +4187,91 @@ def _build_settings_sized_chrome(source_path, cache_key, panel_w, panel_h, row_w
     except Exception as exc:
         optional_failure("ui.settings_sized_chrome",exc);return {}
 
-from .ui_screens_settings import (
-    configure_settings_screens as _configure_settings_screens,
-    SettingsGlassChoiceScreen,
-    SettingsGlassNoticeScreen,
-    SettingsGlassInputScreen,
-    AdvancedSettingsScreen,
-    NovaSettingsScreen,
-)
+_SETTINGS_SCREEN_CLASSES = None
+def _ensure_settings_screens():
+    global _SETTINGS_SCREEN_CLASSES
+    if _SETTINGS_SCREEN_CLASSES is None:
+        from . import ui_screens_settings as _settings_mod
+        _settings_mod.configure_settings_screens(
+            BROWSER_SKIN=BROWSER_SKIN,
+            font_scale_skin=_apply_user_font_scale,
+            ActionMap=ActionMap,
+            BUILD_NAME=BUILD_NAME,
+            DiagnosticsScreen=DiagnosticsScreen,
+            HOME_HERO_FILE=HOME_HERO_FILE,
+            IMAGE_CACHE_DIR=IMAGE_CACHE_DIR,
+            IconMenuList=IconMenuList,
+            Label=Label,
+            PLUGIN_VERSION=PLUGIN_VERSION,
+            Pixmap=Pixmap,
+            PortalSession=PortalSession,
+            THEMES=THEMES,
+            TMDBClient=TMDBClient,
+            WIZARD_DONE_FILE=WIZARD_DONE_FILE,
+            _=_,
+            _build_settings_popup_chrome=_build_settings_popup_chrome,
+            _build_settings_sized_chrome=_build_settings_sized_chrome,
+            _neutral_utility_glass=_neutral_utility_glass,
+            _settings_popup_source=_settings_popup_source,
+            _settings_popup_backdrop=_settings_popup_backdrop,
+            _settings_text_width_px=_settings_text_width_px,
+            _invalidate_source_navigation_cache=_invalidate_source_navigation_cache,
+            asset=asset,
+            backup_choices=backup_choices,
+            cleanup_image_cache=cleanup_image_cache,
+            create_backup=create_backup,
+            ePoint=ePoint,
+            eSize=eSize,
+            export_support_bundle=export_support_bundle,
+            getDesktop=getDesktop,
+            hashlib=hashlib,
+            hdd_read_ready=hdd_read_ready,
+            inspect_backup=inspect_backup,
+            json=json,
+            list_backups=list_backups,
+            load_settings=load_settings,
+            load_profiles=load_profiles,
+            _load_content_art=_load_content_art,
+            _load_visual_bundle=_load_visual_bundle,
+            load_theme=load_theme,
+            optional_failure=optional_failure,
+            os=os,
+            parental_hash_pin=parental_hash_pin,
+            parental_is_unlocked=parental_is_unlocked,
+            parental_lock_now=parental_lock_now,
+            parental_pin_is_default=parental_pin_is_default,
+            parental_remaining_minutes=parental_remaining_minutes,
+            prune_persistent_cache=prune_persistent_cache,
+            restore_backup=restore_backup,
+            save_settings=save_settings,
+            save_theme=save_theme,
+            save_tmdb_credential=save_tmdb_credential,
+            secret_backup_warning=secret_backup_warning,
+            update_api_keys=update_api_keys,
+        )
+        _SETTINGS_SCREEN_CLASSES = (
+            _settings_mod.SettingsGlassChoiceScreen,
+            _settings_mod.SettingsGlassNoticeScreen,
+            _settings_mod.SettingsGlassInputScreen,
+            _settings_mod.AdvancedSettingsScreen,
+            _settings_mod.NovaSettingsScreen,
+        )
+    return _SETTINGS_SCREEN_CLASSES
+
+def SettingsGlassChoiceScreen(session, *args, **kwargs):
+    return _ensure_settings_screens()[0](session, *args, **kwargs)
+
+def SettingsGlassNoticeScreen(session, *args, **kwargs):
+    return _ensure_settings_screens()[1](session, *args, **kwargs)
+
+def SettingsGlassInputScreen(session, *args, **kwargs):
+    return _ensure_settings_screens()[2](session, *args, **kwargs)
+
+def AdvancedSettingsScreen(session, *args, **kwargs):
+    return _ensure_settings_screens()[3](session, *args, **kwargs)
+
+def NovaSettingsScreen(session, *args, **kwargs):
+    return _ensure_settings_screens()[4](session, *args, **kwargs)
 
 
 
@@ -3337,11 +4296,21 @@ from .ui_grid_base import (
 from .ui_grid_screens import (
     configure_grid_screens as _configure_grid_screens,
     PremiumPosterGridScreen,
+    PremiumPosterGridV2Screen,
     PremiumLiveGridScreen,
 )
-
-
-
+from .ui_cinematic_global import (
+    configure_cinematic_global as _configure_cinematic_global,
+    PremiumGlobalCinematicScreen,
+)
+from .ui_backdrop_grid import (
+    configure_backdrop_grid as _configure_backdrop_grid,
+    PremiumBackdropGridScreen,
+)
+from .ui_backdrop_grid2 import (
+    configure_backdrop_grid2 as _configure_backdrop_grid2,
+    PremiumBackdropGrid2Screen,
+)
 
 
 from .ui_screens_search import (
@@ -3388,7 +4357,9 @@ def _detail_cover_artwork(source_path, size=(360,560)):
                 mask=_PILImage.new("L",(tw,th),0);md=_ImageDraw.Draw(mask)
                 md.rounded_rectangle((0,0,tw-1,th-1),radius=18,fill=255)
                 image.putalpha(mask)
-            _persistent_write_require(temp);image.save(temp,"PNG")
+            # Receiver CPUs are slow at zlib compression. This derivative is a
+            # local first-paint cache, so favor decode/write speed over a few KB.
+            _persistent_write_require(temp);image.save(temp,"PNG",compress_level=0)
         _persistent_write_require(target);os.replace(temp,target)
         return target
     except Exception as exc:
@@ -3422,18 +4393,28 @@ _configure_details_screen(
     Pixmap=Pixmap,
     RT_HALIGN_LEFT=RT_HALIGN_LEFT,
     RT_HALIGN_RIGHT=RT_HALIGN_RIGHT,
+    RT_HALIGN_CENTER=RT_HALIGN_CENTER,
     SeriesEpisodesScreen=SeriesEpisodesScreen,
     THUMB_CACHE_DIR=THUMB_CACHE_DIR,
+    HOME_HERO_FILE=HOME_HERO_FILE,
+    HOME_HERO_SCHEMA=HOME_HERO_SCHEMA,
+    HOME_RUNTIME_DIR=HOME_RUNTIME_DIR,
+    _HOME_HERO_LOCK=_HOME_HERO_LOCK,
+    _prepare_single_home_hero=_prepare_single_home_hero,
+    _cleanup_legacy_home_hero_storage=_cleanup_legacy_home_hero_storage,
     UltraStalkerPlayer=UltraStalkerPlayer,
     _ADAPTIVE_EXECUTOR=_ADAPTIVE_EXECUTOR,
     _BACKDROP_PRESENT_EXECUTOR=_BACKDROP_PRESENT_EXECUTOR,
     _DETAIL_PREFETCH_EXECUTOR=_DETAIL_PREFETCH_EXECUTOR,
+    _DETAIL_LOGO_EXECUTOR=_DETAIL_LOGO_EXECUTOR,
     _IMAGE_EXECUTOR=_IMAGE_EXECUTOR,
     _backdrop_url=_backdrop_url,
     _build_dynamic_details_chrome=_build_dynamic_details_chrome,
     _build_dynamic_details_gradient=_build_dynamic_details_gradient,
     _build_dynamic_poster_accent=_build_dynamic_poster_accent,
     _build_integrated_backdrop=_build_integrated_backdrop,
+    _build_home_adaptive_focus=_build_home_adaptive_focus,
+    _build_home_mood_assets=_build_home_mood_assets,
     _catalogue_title=_catalogue_title,
     _clean_display_text=_clean_display_text,
     _compose_information_text=_compose_information_text,
@@ -3453,23 +4434,29 @@ _configure_details_screen(
     _verified_external_art=_verified_external_art,
     asset=asset,
     eLabel=eLabel,
+    ePoint=ePoint,
+    eSize=eSize,
     eTimer=eTimer,
     gFont=gFont,
     hashlib=hashlib,
+    current_plugin_launch=current_plugin_launch,
     identity_cache_compatible=identity_cache_compatible,
     is_favorite=is_favorite,
     load_artwork_v2_manifest=load_artwork_v2_manifest,
+    load_artwork_v2_fast_local_poster=load_artwork_v2_fast_local_poster,
     load_content_quality=load_content_quality,
     load_detail_snapshot=load_detail_snapshot,
     load_detail_snapshot_by_tmdb=load_detail_snapshot_by_tmdb,
     load_playback_progress=load_playback_progress,
     load_settings=load_settings,
+    hdd_read_ready=hdd_read_ready,
     load_shared_detail_snapshot=load_shared_detail_snapshot,
     math=math,
     movie_job=movie_job,
     optional_failure=optional_failure,
     os=os,
     premium_title=premium_title,
+    parseColor=parseColor,
     quality_badges=quality_badges,
     queue=queue,
     re=re,
@@ -3482,7 +4469,8 @@ _configure_details_screen(
 
 
 _configure_search_screen(
-    BROWSER_SKIN=BROWSER_SKIN,
+    SEARCH_SKIN=_prepare_runtime_skin(SEARCH_SKIN),
+    HOME_HERO_FILE=HOME_HERO_FILE,
     ActionMap=ActionMap,
     ContentDetailsScreen=ContentDetailsScreen,
     IconMenuList=IconMenuList,
@@ -3498,20 +4486,36 @@ _configure_search_screen(
     _friendly_error=_friendly_error,
     _load_recent_searches=_load_recent_searches,
     _neutral_utility_glass=_neutral_utility_glass,
+    _build_category_extended_backdrop=_build_category_extended_backdrop,
+    _build_dynamic_settings_episode_rows=_build_dynamic_settings_episode_rows,
+    _DETAIL_PREFETCH_EXECUTOR=_DETAIL_PREFETCH_EXECUTOR,
+    _build_dynamic_details_chrome=_build_dynamic_details_chrome,
+    _build_dynamic_details_gradient=_build_dynamic_details_gradient,
+    _build_integrated_backdrop=_build_integrated_backdrop,
+    _detail_cover_artwork=_detail_cover_artwork,
+    _download_portal_artwork=_download_portal_artwork,
+    _load_visual_bundle=_load_visual_bundle,
+    _save_visual_bundle=_save_visual_bundle,
+    THUMB_CACHE_DIR=THUMB_CACHE_DIR,
     _player_payload=_player_payload,
     _save_recent_search=_save_recent_search,
     _strip_portal_artwork=_strip_portal_artwork,
     as_completed=as_completed,
     asset=asset,
+    hashlib=hashlib,
+    json=json,
     ePoint=ePoint,
     eSize=eSize,
     eTimer=eTimer,
     getDesktop=getDesktop,
+    identity_cache_compatible=identity_cache_compatible,
     load_profiles=load_profiles,
     load_settings=load_settings,
     one_line=one_line,
     optional_failure=optional_failure,
     os=os,
+    parseColor=parseColor,
+    provider_urlopen=provider_urlopen,
     premium_title=premium_title,
     quality_badges=quality_badges,
     queue=queue,
@@ -3521,6 +4525,7 @@ _configure_search_screen(
 
 _configure_grid_screens(
     POSTER_GRID_SKIN=POSTER_GRID_SKIN,
+    POSTER_GRID_V2_SKIN=POSTER_GRID_V2_SKIN,
     LIVE_GRID_SKIN=LIVE_GRID_SKIN,
     LOG=LOG,
     Label=Label,
@@ -3530,7 +4535,11 @@ _configure_grid_screens(
     UltraStalkerPlayer=UltraStalkerPlayer,
     _GRID_ACCENT_EXECUTOR=_GRID_ACCENT_EXECUTOR,
     _GRID_NAV_STATE=_GRID_NAV_STATE,
+    _PGV2_HERO_EXECUTOR=_PGV2_HERO_EXECUTOR,
+    _PGV2_MATERIAL_EXECUTOR=_PGV2_MATERIAL_EXECUTOR,
     _build_live_adaptive_chrome_211=_build_live_adaptive_chrome_211,
+    _fit_live_row_picon_canvas=_fit_live_row_picon_canvas,
+    PERSISTENT_GENERATED_DIR=PERSISTENT_GENERATED_DIR,
     _clean_display_text=_clean_display_text,
     _clean_live_channel_name=_clean_live_channel_name,
     _configured_playback_engine=_configured_playback_engine,
@@ -3559,6 +4568,59 @@ _configure_grid_screens(
 )
 
 
+_configure_cinematic_global(
+    CINEMATIC_GLOBAL_SKIN=CINEMATIC_GLOBAL_SKIN,
+    ActionMap=ActionMap,
+    Label=Label,
+    Pixmap=Pixmap,
+    eTimer=eTimer,
+    asset=asset,
+    quality_badges=quality_badges,
+    load_content_states=load_content_states,
+    load_content_qualities=load_content_qualities,
+    _strip_portal_artwork=_strip_portal_artwork,
+    _image_url=_image_url,
+    _backdrop_url=_backdrop_url,
+    _download_portal_artwork=_download_portal_artwork,
+    _FAST_POSTER_EXECUTOR=_FAST_POSTER_EXECUTOR,
+    _GRID_ACCENT_EXECUTOR=_GRID_ACCENT_EXECUTOR,
+    _build_dynamic_details_chrome=_build_dynamic_details_chrome,
+    _build_dynamic_details_gradient=_build_dynamic_details_gradient,
+    _build_dynamic_poster_accent=_build_dynamic_poster_accent,
+    _build_integrated_backdrop=_build_integrated_backdrop,
+    _detail_cover_artwork=_detail_cover_artwork,
+    _load_visual_bundle=_load_visual_bundle,
+    _save_visual_bundle=_save_visual_bundle,
+    THUMB_CACHE_DIR=THUMB_CACHE_DIR,
+    _release_pixmap_widget=_release_pixmap_widget,
+    _native_image_pressure_relief=_native_image_pressure_relief,
+    UltraStalkerPlayer=UltraStalkerPlayer,
+    _configured_playback_engine=_configured_playback_engine,
+    _player_payload=_player_payload,
+)
+
+
+
+_configure_backdrop_grid(
+    BACKDROP_GRID_SKIN=BACKDROP_GRID_SKIN,
+    ActionMap=ActionMap,
+    Label=Label,
+    Pixmap=Pixmap,
+    asset=asset,
+    cached_png=cached_png,
+    THUMB_CACHE_DIR=THUMB_CACHE_DIR,
+    _load_visual_bundle=_load_visual_bundle,
+    _build_dynamic_details_chrome=_build_dynamic_details_chrome,
+    _build_thumbnail=_build_thumbnail,
+    _build_cover_thumbnail=_build_cover_thumbnail,
+    _grid_card_chrome_from_poster=_grid_card_chrome_from_poster,
+    _grid_selection_asset_from_poster=_grid_selection_asset_from_poster,
+    _native_image_pressure_relief=_native_image_pressure_relief,
+    _download_portal_artwork=_download_portal_artwork,
+)
+
+_configure_backdrop_grid2(BACKDROP_GRID2_SKIN=BACKDROP_GRID2_SKIN)
+
 
 _configure_grid_base(
     ActionMap=ActionMap,
@@ -3579,10 +4641,10 @@ _configure_grid_base(
     _CATEGORY_PREFETCH_EXECUTOR=_CATEGORY_PREFETCH_EXECUTOR,
     _SERIES_HIERARCHY_PREFETCH_EXECUTOR=_SERIES_HIERARCHY_PREFETCH_EXECUTOR,
     _FAST_POSTER_EXECUTOR=_FAST_POSTER_EXECUTOR,
+    _DETAIL_PREFETCH_EXECUTOR=_DETAIL_PREFETCH_EXECUTOR,
     _GRID_EPG_EXECUTOR=_GRID_EPG_EXECUTOR,
     _GRID_NAV_STATE=_GRID_NAV_STATE,
     _POSTER_RESCUE_EXECUTOR=_POSTER_RESCUE_EXECUTOR,
-    _PROGRESSIVE_POSTER_EXECUTOR=_PROGRESSIVE_POSTER_EXECUTOR,
     _available_memory_mb=_available_memory_mb,
     _build_cover_thumbnail=_build_cover_thumbnail,
     _build_integrated_backdrop=_build_integrated_backdrop,
@@ -3592,9 +4654,15 @@ _configure_grid_base(
     _clean_display_text=_clean_display_text,
     _clean_live_channel_name=_clean_live_channel_name,
     _clear_artwork_failure=_clear_artwork_failure,
+    HOME_HERO_FILE=HOME_HERO_FILE,
+    HOME_HERO_SCHEMA=HOME_HERO_SCHEMA,
+    _HOME_HERO_LOCK=_HOME_HERO_LOCK,
+    _prepare_single_home_hero=_prepare_single_home_hero,
+    _build_home_adaptive_focus=_build_home_adaptive_focus,
+    _build_home_mood_assets=_build_home_mood_assets,
+    _IMAGE_EXECUTOR=_IMAGE_EXECUTOR,
     _configured_playback_engine=_configured_playback_engine,
     _download_portal_artwork=_download_portal_artwork,
-    _download_xtream_provider_pair=_download_xtream_provider_pair,
     _friendly_error=_friendly_error,
     _grid_card_chrome_cached=_grid_card_chrome_cached,
     _grid_card_chrome_from_poster=_grid_card_chrome_from_poster,
@@ -3604,6 +4672,8 @@ _configure_grid_base(
     _image_url=_image_url,
     _live_restart_trace=_live_restart_trace,
     _load_content_art=_load_content_art,
+    _load_recent_searches=_load_recent_searches,
+    _save_recent_search=_save_recent_search,
     _load_visual_bundle=_load_visual_bundle,
     _memory_pressure=_memory_pressure,
     _player_payload=_player_payload,
@@ -3626,12 +4696,14 @@ _configure_grid_base(
     hashlib=hashlib,
     identity_cache_compatible=identity_cache_compatible,
     load_artwork_v2_manifest=load_artwork_v2_manifest,
+    load_artwork_v2_fast_local_poster=load_artwork_v2_fast_local_poster,
     load_content_qualities=load_content_qualities,
     load_content_states=load_content_states,
     load_detail_snapshot=load_detail_snapshot,
     load_detail_snapshot_by_imdb=load_detail_snapshot_by_imdb,
     load_detail_snapshot_by_tmdb=load_detail_snapshot_by_tmdb,
     load_settings=load_settings,
+    hdd_read_ready=hdd_read_ready,
     load_shared_detail_snapshot=load_shared_detail_snapshot,
     mark_watched=mark_watched,
     normalize_quality=normalize_quality,
@@ -3651,6 +4723,7 @@ _configure_grid_base(
 
 _configure_grid_artwork(
     LOG=LOG,
+    ArtworkV2=ArtworkV2,
     OrderedDict=OrderedDict,
     THUMB_CACHE_DIR=THUMB_CACHE_DIR,
     _GLOBAL_GRID_PIXMAP_CACHE=_GLOBAL_GRID_PIXMAP_CACHE,
@@ -3658,7 +4731,9 @@ _configure_grid_artwork(
     _GLOBAL_GRID_PIXMAP_CACHE_LOCK=_GLOBAL_GRID_PIXMAP_CACHE_LOCK,
     _GRID_ACCENT_CACHE=_GRID_ACCENT_CACHE,
     _GRID_ACCENT_EXECUTOR=_GRID_ACCENT_EXECUTOR,
+    _GRID_MOOD_EXECUTOR=_GRID_MOOD_EXECUTOR,
     _IMAGE_EXECUTOR=_IMAGE_EXECUTOR,
+    _VISIBLE_PROVIDER_POSTER_EXECUTOR=_VISIBLE_PROVIDER_POSTER_EXECUTOR,
     _POSTER_THUMB_EXECUTOR=_POSTER_THUMB_EXECUTOR,
     _PILImage=_PILImage,
     _artwork_attempt_allowed=_artwork_attempt_allowed,
@@ -3711,6 +4786,7 @@ _configure_browser_screen(
     ContentDetailsScreen=ContentDetailsScreen,
     HOME_HERO_FILE=HOME_HERO_FILE,
     IMAGE_CACHE_DIR=IMAGE_CACHE_DIR,
+    PERSISTENT_ARTWORK_DIRS=(PERSISTENT_ART_DIR,BACKDROP_CACHE_DIR,PERSISTENT_GENERATED_DIR,PERSISTENT_HOME_DIR,PERSISTENT_LIVE_DIR),
     IconMenuList=IconMenuList,
     Input=Input,
     InputBox=InputBox,
@@ -3722,20 +4798,38 @@ _configure_browser_screen(
     PortalSession=PortalSession,
     PremiumLiveGridScreen=PremiumLiveGridScreen,
     PremiumPosterGridScreen=PremiumPosterGridScreen,
+    PremiumPosterGridV2Screen=PremiumPosterGridV2Screen,
+    PremiumGlobalCinematicScreen=PremiumGlobalCinematicScreen,
+    PremiumBackdropGridScreen=PremiumBackdropGridScreen,
+    PremiumBackdropGrid2Screen=PremiumBackdropGrid2Screen,
     SettingsGlassNoticeScreen=SettingsGlassNoticeScreen,
     ThreadPoolExecutor=ThreadPoolExecutor,
     UltraStalkerPlayer=UltraStalkerPlayer,
     _IMAGE_EXECUTOR=_IMAGE_EXECUTOR,
+    _GRID_EPG_EXECUTOR=_GRID_EPG_EXECUTOR,
     _PICON_CACHE_EXECUTOR=_PICON_CACHE_EXECUTOR,
+    _CATEGORY_PREFETCH_EXECUTOR=_CATEGORY_PREFETCH_EXECUTOR,
     _accent_for=_accent_for,
     _build_category_adaptive_chrome=_build_category_adaptive_chrome,
+    _build_category_extended_backdrop=_build_category_extended_backdrop,
+    _build_cover_thumbnail=_build_cover_thumbnail,
+    _grid_card_chrome_from_poster=_grid_card_chrome_from_poster,
+    _grid_selection_asset_from_poster=_grid_selection_asset_from_poster,
+    _load_visual_bundle=_load_visual_bundle,
+    _save_visual_bundle=_save_visual_bundle,
     _cached_live_picon_path=_cached_live_picon_path,
+    _fit_live_picon_canvas=_fit_live_picon_canvas,
+    PERSISTENT_GENERATED_DIR=PERSISTENT_GENERATED_DIR,
     _category_cache_get=_category_cache_get,
     _category_cache_put=_category_cache_put,
+    _category_cache_age=_category_cache_age,
+    _CATEGORY_CACHE_TTL=_CATEGORY_CACHE_TTL,
     _clean_display_text=_clean_display_text,
+    _clean_live_channel_name=_clean_live_channel_name,
     _configured_playback_engine=_configured_playback_engine,
     _download_portal_artwork=_download_portal_artwork,
     _download_public_live_picon=_download_public_live_picon,
+    _download_live_portal_temp_picon=_download_live_portal_temp_picon,
     _friendly_error=_friendly_error,
     _image_url=_image_url,
     _letter_placeholder=_letter_placeholder,
@@ -3753,6 +4847,7 @@ _configure_browser_screen(
     _search_key=_search_key,
     _source_art_url=_source_art_url,
     _strip_portal_artwork=_strip_portal_artwork,
+    _settings_text_width_px=_settings_text_width_px,
     add_recently_played=add_recently_played,
     as_completed=as_completed,
     asset=asset,
@@ -3764,6 +4859,10 @@ _configure_browser_screen(
     eTimer=eTimer,
     epg_summary=epg_summary,
     event_times=event_times,
+    export_live_category_bouquet=export_live_category_bouquet,
+    export_receiver_items=export_receiver_items,
+    export_series_category_bouquets=export_series_category_bouquets,
+    reload_bouquets=reload_bouquets,
     force_session_silence=force_session_silence,
     getDesktop=getDesktop,
     hashlib=hashlib,
@@ -3773,6 +4872,7 @@ _configure_browser_screen(
     loadPNG=loadPNG,
     load_content_states=load_content_states,
     load_continue_watching=load_continue_watching,
+    load_detail_snapshot=load_detail_snapshot,
     load_favorites=load_favorites,
     load_settings=load_settings,
     mark_watched=mark_watched,
@@ -3799,9 +4899,13 @@ _configure_browser_screen(
 
 _configure_portal_list(
     MAIN_SKIN=MAIN_SKIN,
+    font_scale_skin=_apply_user_font_scale,
     _plugin_original_service_getter=lambda: _PLUGIN_ORIGINAL_SERVICE,
     _plugin_service_captured_getter=lambda: _PLUGIN_SERVICE_CAPTURED,
     DiagnosticsScreen=DiagnosticsScreen,
+    SettingsGlassChoiceScreen=SettingsGlassChoiceScreen,
+    SettingsGlassNoticeScreen=SettingsGlassNoticeScreen,
+    SettingsGlassInputScreen=SettingsGlassInputScreen,
     HOME_HERO_FILE=HOME_HERO_FILE,
     HTTP_WARNING=HTTP_WARNING,
     http_warning_for=http_warning_for,
@@ -3820,12 +4924,18 @@ _configure_portal_list(
     _validate_profile_client=_validate_profile_client,
     asset=asset,
     consume_recovery_notices=consume_recovery_notices,
+    create_backup=create_backup,
+    inspect_backup=inspect_backup,
+    list_backups=list_backups,
+    restore_backup=restore_backup,
     disable_profiles=disable_profiles,
     duplicate_profile=duplicate_profile,
     enable_profile=enable_profile,
     export_live_integration=export_live_integration,
     load_disabled_profiles=load_disabled_profiles,
     load_profiles=load_profiles,
+    load_server_library=load_server_library,
+    import_server_library_profiles=import_server_library_profiles,
     load_settings=load_settings,
     mark_http_consent=mark_http_consent,
     optional_failure=optional_failure,
@@ -3839,6 +4949,7 @@ _configure_portal_list(
     requires_http_consent=requires_http_consent,
     restore_plugin_service=restore_plugin_service,
     save_profiles=save_profiles,
+    save_settings=save_settings,
     save_theme=save_theme,
     save_ui_state=save_ui_state,
     start_proxy_server=start_proxy_server,
@@ -3862,15 +4973,19 @@ _configure_home_screen(
     UltraStalkerPlayer=UltraStalkerPlayer,
     _CATEGORY_PREFETCH_EXECUTOR=_CATEGORY_PREFETCH_EXECUTOR,
     _HOME_HERO_LOCK=_HOME_HERO_LOCK,
-    _IMAGE_EXECUTOR=_IMAGE_EXECUTOR,
+    _IMAGE_EXECUTOR=_GLOBAL_HYDRATION_EXECUTOR,
+    PERSISTENT_GENERATED_DIR=PERSISTENT_GENERATED_DIR,
+    _fit_live_picon_canvas=_fit_live_picon_canvas,
     _PILImage=_PILImage,
     _build_home_adaptive_focus=_build_home_adaptive_focus,
-    _build_home_hero=_build_home_hero,
     _build_home_mood_assets=_build_home_mood_assets,
+    _cleanup_legacy_home_hero_storage=_cleanup_legacy_home_hero_storage,
     _category_cache_get=_category_cache_get,
     _category_cache_put=_category_cache_put,
+    _invalidate_source_navigation_cache=_invalidate_source_navigation_cache,
     _clean_display_text=_clean_display_text,
     _configured_playback_engine=_configured_playback_engine,
+    _client_from_profile=_client_from_profile,
     _fsync_parent_dir=_fsync_parent_dir,
     _home_prepare_art=_home_prepare_art,
     _home_cached_art=_home_cached_art,
@@ -3882,12 +4997,17 @@ _configure_home_screen(
     load_playback_progress=load_playback_progress,
     load_profiles=load_profiles,
     load_recently_played=load_recently_played,
+    history_revision=history_revision,
     load_settings=load_settings,
     load_ui_state=load_ui_state,
     optional_failure=optional_failure,
     premium_title=premium_title,
     save_profiles=save_profiles,
     save_ui_state=save_ui_state,
+    home_boot_pixmap=home_boot_pixmap,
+    splash_home_is_warm=splash_home_is_warm,
+    splash_home_account_info=splash_home_account_info,
+    splash_home_recent_assets=splash_home_recent_assets,
     ContentDetailsScreen=ContentDetailsScreen,
     NovaSettingsScreen=NovaSettingsScreen,
     PortalBrowserScreen=PortalBrowserScreen,
@@ -3952,55 +5072,18 @@ _configure_series_screen(
 
 
 
-_configure_settings_screens(
-    BROWSER_SKIN=BROWSER_SKIN,
-    ActionMap=ActionMap,
-    BUILD_NAME=BUILD_NAME,
-    DiagnosticsScreen=DiagnosticsScreen,
-    HOME_HERO_FILE=HOME_HERO_FILE,
-    IMAGE_CACHE_DIR=IMAGE_CACHE_DIR,
-    IconMenuList=IconMenuList,
-    Label=Label,
-    PLUGIN_VERSION=PLUGIN_VERSION,
-    Pixmap=Pixmap,
-    PortalSession=PortalSession,
-    THEMES=THEMES,
-    TMDBClient=TMDBClient,
-    WIZARD_DONE_FILE=WIZARD_DONE_FILE,
-    _=_,
-    _build_settings_popup_chrome=_build_settings_popup_chrome,
-    _build_settings_sized_chrome=_build_settings_sized_chrome,
-    _neutral_utility_glass=_neutral_utility_glass,
-    _settings_popup_source=_settings_popup_source,
-    _settings_text_width_px=_settings_text_width_px,
-    asset=asset,
-    backup_choices=backup_choices,
-    cleanup_image_cache=cleanup_image_cache,
-    create_backup=create_backup,
-    ePoint=ePoint,
-    eSize=eSize,
-    export_support_bundle=export_support_bundle,
-    getDesktop=getDesktop,
-    hashlib=hashlib,
-    hdd_read_ready=hdd_read_ready,
-    inspect_backup=inspect_backup,
-    json=json,
-    list_backups=list_backups,
-    load_settings=load_settings,
-    load_theme=load_theme,
-    optional_failure=optional_failure,
-    os=os,
-    parental_hash_pin=parental_hash_pin,
-    parental_is_unlocked=parental_is_unlocked,
-    parental_lock_now=parental_lock_now,
-    parental_pin_is_default=parental_pin_is_default,
-    parental_remaining_minutes=parental_remaining_minutes,
-    prune_persistent_cache=prune_persistent_cache,
-    restore_backup=restore_backup,
-    save_settings=save_settings,
-    save_theme=save_theme,
-    save_tmdb_credential=save_tmdb_credential,
-    secret_backup_warning=secret_backup_warning,
-    update_api_keys=update_api_keys,
-)
+# R47: finish the cold-start GC guard quietly. Flush generation 0 only, then
+# restore the receiver's original automatic-GC state. No thresholds are changed.
+try:
+    if _IMPORT46_GC_WAS_ENABLED:
+        try:
+            gc.collect(0)
+        finally:
+            gc.enable()
+except Exception:
+    try:
+        if _IMPORT46_GC_WAS_ENABLED:
+            gc.enable()
+    except Exception:
+        pass
 

@@ -94,7 +94,7 @@ def get_logger():
     if _LOGGER is not None:
         return _LOGGER
     logger = logging.getLogger("UltraStalker")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.WARNING)
     logger.propagate = False
     if not logger.handlers:
         try:
@@ -121,7 +121,7 @@ def configure_logger(diagnostic=None):
         except Exception:
             diagnostic=False
     enabled=bool(diagnostic)
-    logger.setLevel(logging.DEBUG if enabled else logging.INFO)
+    logger.setLevel(logging.DEBUG if enabled else logging.WARNING)
     try:
         from .core.runtime_log import configure_runtime_log
         configure_runtime_log(persistent=enabled)
@@ -129,6 +129,45 @@ def configure_logger(diagnostic=None):
         pass
     return logger
 
+
+
+def memory_snapshot(tag, **fields):
+    """Log one process-memory snapshot only in explicit diagnostic mode.
+
+    This is deliberately passive: it only reads /proc for the current Enigma2
+    process.  It never calls gc.collect(), drops caches, touches pixmaps or
+    changes screen/player behaviour.  Values are resident-process measurements,
+    not estimates from Python object counts.
+    """
+    try:
+        logger=get_logger()
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        status={}
+        with open("/proc/self/status","r",encoding="ascii",errors="ignore") as fh:
+            for line in fh:
+                if ":" not in line:continue
+                key,value=line.split(":",1)
+                if key in ("VmRSS","VmHWM","VmSize","VmData","VmSwap","RssAnon","RssFile","Threads"):
+                    status[key]=value.strip()
+        def _kb(name):
+            raw=str(status.get(name) or "0").split()[0]
+            try:return int(raw)
+            except Exception:return 0
+        try:fds=len(os.listdir("/proc/self/fd"))
+        except Exception:fds=-1
+        def _clean(value):
+            text=str(value if value is not None else "")
+            return text.replace(" ","_").replace("\n","")[:120]
+        extras=" ".join("%s=%s"%(str(k),_clean(v)) for k,v in sorted(fields.items()))
+        logger.debug(
+            "MEM34 tag=%s rss_mb=%.1f hwm_mb=%.1f anon_mb=%.1f file_mb=%.1f data_mb=%.1f vmsize_mb=%.1f swap_mb=%.1f threads=%s fds=%s%s",
+            _clean(tag),_kb("VmRSS")/1024.0,_kb("VmHWM")/1024.0,_kb("RssAnon")/1024.0,
+            _kb("RssFile")/1024.0,_kb("VmData")/1024.0,_kb("VmSize")/1024.0,_kb("VmSwap")/1024.0,
+            str(status.get("Threads") or "?"),str(fds),(" "+extras) if extras else ""
+        )
+    except Exception:
+        pass
 
 def exception(message):
     try:

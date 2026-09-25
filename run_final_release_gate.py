@@ -16,7 +16,7 @@ import shutil
 
 PLUGIN_DIR = os.path.abspath(os.path.dirname(__file__))
 PYTHON_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(PLUGIN_DIR)))
-EXPECTED_VERSION = "10.1.0-beta77-rc4-secfix22-ui10-m3useriesfast2-navfix-cachefast-hudfix-publicpath57-subrowpolish-homeinstant-backdroprestore-hardvisuallock-cleantitlemeta"
+EXPECTED_VERSION = "9.1.1"
 
 
 
@@ -50,7 +50,14 @@ def _failures_static():
     failures.extend(_clean_bytecode())
 
     # No unsafe packaged file modes.
-    for root, _dirs, files in os.walk(PLUGIN_DIR):
+    for root, dirs, files in os.walk(PLUGIN_DIR):
+        for name in dirs:
+            path=os.path.join(root,name)
+            try:mode=os.stat(path).st_mode
+            except OSError as exc:
+                failures.append("cannot stat directory %s: %s"%(path,exc));continue
+            if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_IWOTH):
+                failures.append("unsafe packaged directory mode: %s"%path)
         for name in files:
             path = os.path.join(root, name)
             try:
@@ -76,9 +83,33 @@ def _failures_static():
         failures.append("cannot validate version.py: %s" % exc)
 
     # Required release tooling must ship with the package.
-    for name in ("run_release_gates.py", "run_tests.py", "run_receiver_soak_check.py"):
+    for name in ("run_release_gates.py", "run_tests.py", "run_receiver_soak_check.py", "run_ownership_gate.py"):
         if not os.path.isfile(os.path.join(PLUGIN_DIR, name)):
             failures.append("missing release tool: %s" % name)
+
+    # V7 core guarantees: online updater and LAN web surface must survive every
+    # public update. Free Portal/Xtream catalogs are persistent user/runtime
+    # data and this package may intentionally omit replacement payloads.
+    for name in ("updater.py", "webcleaner.py"):
+        if not os.path.isfile(os.path.join(PLUGIN_DIR, name)):
+            failures.append("missing V7 core component: %s" % name)
+
+    # R270 catalog packaging policy: both real catalogue payloads are part of
+    # the release baseline.  Missing/header-only files are a hard failure because
+    # the installer intentionally refreshes these two built-in libraries.
+    package_root = os.path.abspath(os.path.join(PLUGIN_DIR, "../../../../../../.."))
+    required_catalog_payloads = (
+        (os.path.join(package_root, "etc/enigma2/ultrastalker/.uslib/.catalog_a"), 20000, "Free Portal Library"),
+        (os.path.join(package_root, "etc/enigma2/ultrastalker/.uslib/.catalog_b"), 300000, "Free Xtream Library"),
+    )
+    for path, min_size, label in required_catalog_payloads:
+        try:
+            if not os.path.isfile(path):
+                failures.append("missing bundled %s" % label)
+            elif os.path.getsize(path) < min_size:
+                failures.append("truncated bundled %s" % label)
+        except OSError:
+            failures.append("cannot validate bundled %s" % label)
 
     return failures
 
@@ -99,8 +130,28 @@ def main():
             print(" - %s" % item)
         return 1
 
+    if _run("run_ownership_gate.py") != 0:
+        print("FINAL RELEASE GATE: FAIL (ownership/provenance gate)")
+        return 1
+
     if _run("run_release_gates.py") != 0:
         print("FINAL RELEASE GATE: FAIL (focused security gates)")
+        return 1
+
+    if _run("run_r161_gate.py") != 0:
+        print("FINAL RELEASE GATE: FAIL (R161 Search history gate)")
+        return 1
+
+    if _run("run_r164_gate.py") != 0:
+        print("FINAL RELEASE GATE: FAIL (R164 federated Search/Web/Home gate)")
+        return 1
+
+    if _run("run_r165_gate.py") != 0:
+        print("FINAL RELEASE GATE: FAIL (Xtream category Search gate)")
+        return 1
+
+    if _run("run_localization_gate.py") != 0:
+        print("FINAL RELEASE GATE: FAIL (localization completeness gate)")
         return 1
 
     if _run("run_tests.py") != 0:
@@ -118,8 +169,14 @@ def main():
     print(" - version metadata coherent: %s" % EXPECTED_VERSION)
     print(" - Python source compile validation passed")
     print(" - no packaged bytecode / unsafe file modes")
+    print(" - Final V9.1.1 Free Portal / Free Xtream catalogue payloads are present and non-truncated")
+    print(" - ownership/provenance gate passed")
     print(" - focused security gates passed")
-    print(" - full regression suite passed")
+    print(" - current Search-history / Home-recent contract gate passed")
+    print(" - current federated Search / Web manager / Home hierarchy gate passed")
+    print(" - Xtream category-id progressive Search gate passed")
+    print(" - localization completeness gate passed")
+    print(" - regression tool passed (full suite pre-package; release-clean package self-check when tests are intentionally omitted)")
     print(" - receiver soak remains a deployment-time gate; run run_receiver_soak_check.py after real hardware soak")
     return 0
 

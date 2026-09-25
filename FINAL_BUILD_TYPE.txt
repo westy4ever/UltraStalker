@@ -1,8 +1,1 @@
-Ultra Stalker
-Build: Public / Production Candidate
-Version: 10.1.0-beta57-rc4-secfix22-ui10
-Runtime package for end users.
-
-Promotion rule:
-- run_final_release_gate.py must PASS before promotion to Stable.
-- real receiver soak must PASS via run_receiver_soak_check.py after the required hardware test window.
+Ultra Stalker Final V9.1.1

@@ -1,0 +1,17 @@
+Ultra Stalker - Third-Party Notices
+
+Ultra Stalker includes or redistributes the following third-party components.
+Their original copyright notices and license terms remain in force.
+
+1. python-qrcode related QR implementation
+   License file: webqr/LICENSE.python-qrcode.txt
+   The bundled license notice must be retained with distributions containing
+   this component.
+
+2. Font Awesome Free assets
+   License file: FONT_AWESOME_FREE_LICENSE.txt
+   The bundled license notice must be retained with distributions containing
+   these assets.
+
+This notice does not replace the original third-party license files. It is an
+index to make the provenance of bundled dependencies explicit.

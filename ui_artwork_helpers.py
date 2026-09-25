@@ -3,6 +3,7 @@ import html
 import json
 import os
 import urllib.parse
+import hashlib
 
 from .log import optional_failure
 
@@ -125,3 +126,121 @@ def _normalize_provider_image_url(value):
         return text.replace(" ","%20")
 
 
+
+
+
+def _fit_live_row_picon_canvas(source_path, cache_root, size=(64,36)):
+    """Normalize one Live list-row picon without stretching it.
+
+    Provider picons frequently arrive on oversized transparent canvases.  The
+    old 12-row Live screen rendered those pixels literally, so a perfectly good
+    logo could look tiny even though the widget geometry was correct.  For the
+    list only, trim transparent padding, then aspect-fit the visible logo into
+    an exact-size transparent canvas.  Upscaling is allowed because these are
+    small UI logos, not posters.
+    """
+    try:
+        from PIL import Image as PILImage, ImageOps as PILImageOps
+    except Exception:
+        return source_path if source_path and os.path.isfile(str(source_path)) else ""
+    try:
+        source=str(source_path or "")
+        if not source or not os.path.isfile(source) or os.path.getsize(source)<=100:
+            return ""
+        tw,th=max(1,int(size[0])),max(1,int(size[1]))
+        try: stamp="%s|%s"%(os.path.getmtime(source),os.path.getsize(source))
+        except Exception: stamp="0"
+        root=os.path.join(str(cache_root or ""),"live_row_picon_fit")
+        if not root:
+            return source
+        os.makedirs(root,exist_ok=True)
+        key=hashlib.sha1((source+"|"+stamp+"|row-alpha-trim-upscale-v1|%dx%d"%(tw,th)).encode("utf-8","ignore")).hexdigest()[:24]
+        target=os.path.join(root,key+"_%dx%d.png"%(tw,th))
+        if os.path.isfile(target) and os.path.getsize(target)>100:
+            return target
+        temp=target+".tmp.%d"%os.getpid()
+        with PILImage.open(source) as im:
+            try: im=PILImageOps.exif_transpose(im)
+            except Exception: pass
+            im=im.convert("RGBA")
+            # Remove transparent provider padding before scaling.  A small alpha
+            # threshold also ignores anti-aliased ghost pixels at the outer edge.
+            try:
+                alpha=im.getchannel("A")
+                mask=alpha.point(lambda value: 255 if value>8 else 0)
+                bbox=mask.getbbox()
+                if bbox and bbox!=(0,0,im.width,im.height):
+                    cropped=im.crop(bbox)
+                    if cropped.width>0 and cropped.height>0:
+                        im=cropped
+            except Exception:
+                pass
+            sw,sh=im.size
+            if sw<=0 or sh<=0:
+                return source
+            resampling=getattr(getattr(PILImage,"Resampling",PILImage),"LANCZOS",1)
+            scale=min(float(tw)/float(sw),float(th)/float(sh))
+            nw=max(1,int(round(sw*scale)));nh=max(1,int(round(sh*scale)))
+            if (nw,nh)!=(sw,sh):
+                im=im.resize((nw,nh),resampling)
+            canvas=PILImage.new("RGBA",(tw,th),(0,0,0,0))
+            canvas.alpha_composite(im,((tw-nw)//2,(th-nh)//2))
+            canvas.save(temp,"PNG",compress_level=3,optimize=False)
+        os.replace(temp,target)
+        return target if os.path.isfile(target) and os.path.getsize(target)>100 else source
+    except Exception as exc:
+        optional_failure("ui.live_row_picon_fit",exc)
+        try:
+            if 'temp' in locals() and os.path.exists(temp): os.unlink(temp)
+        except Exception: pass
+        return source_path if source_path and os.path.isfile(str(source_path)) else ""
+
+def _fit_live_picon_canvas(source_path, cache_root, size=(220,132)):
+    """Render a Live picon exactly like an Enigma2 aspect-safe info-bar slot.
+
+    The source is never stretched. It is fitted inside a transparent 220x132
+    canvas, centered on both axes, and cached as PNG so Home and Player reuse
+    the exact same pixels.
+    """
+    try:
+        from PIL import Image as PILImage, ImageOps as PILImageOps
+    except Exception:
+        return source_path if source_path and os.path.isfile(str(source_path)) else ""
+    try:
+        source=str(source_path or "")
+        if not source or not os.path.isfile(source) or os.path.getsize(source)<=100:
+            return ""
+        tw,th=max(1,int(size[0])),max(1,int(size[1]))
+        try: stamp="%s|%s"%(os.path.getmtime(source),os.path.getsize(source))
+        except Exception: stamp="0"
+        root=os.path.join(str(cache_root or ""),"live_picon_fit")
+        if not root:
+            return source
+        os.makedirs(root,exist_ok=True)
+        key=hashlib.sha1((source+"|"+stamp+"|enigma-fit-v2-noupscale|%dx%d"%(tw,th)).encode("utf-8","ignore")).hexdigest()[:24]
+        target=os.path.join(root,key+"_%dx%d.png"%(tw,th))
+        if os.path.isfile(target) and os.path.getsize(target)>100:
+            return target
+        temp=target+".tmp.%d"%os.getpid()
+        with PILImage.open(source) as im:
+            try: im=PILImageOps.exif_transpose(im)
+            except Exception: pass
+            im=im.convert("RGBA")
+            resampling=getattr(getattr(PILImage,"Resampling",PILImage),"LANCZOS",1)
+            sw,sh=im.size
+            if sw<=0 or sh<=0:
+                return source
+            scale=min(1.0,float(tw)/float(sw),float(th)/float(sh))
+            nw=max(1,int(round(sw*scale))); nh=max(1,int(round(sh*scale)))
+            if (nw,nh)!=(sw,sh): im=im.resize((nw,nh),resampling)
+            canvas=PILImage.new("RGBA",(tw,th),(0,0,0,0))
+            canvas.alpha_composite(im,((tw-nw)//2,(th-nh)//2))
+            canvas.save(temp,"PNG",compress_level=3,optimize=False)
+        os.replace(temp,target)
+        return target if os.path.isfile(target) and os.path.getsize(target)>100 else source
+    except Exception as exc:
+        optional_failure("ui.live_picon_fit",exc)
+        try:
+            if 'temp' in locals() and os.path.exists(temp): os.unlink(temp)
+        except Exception: pass
+        return source_path if source_path and os.path.isfile(str(source_path)) else ""

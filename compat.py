@@ -12,10 +12,10 @@ import platform
 import sys
 from typing import Final
 
-MIN_PYTHON: Final[tuple[int, int]] = (3, 13)
-MAX_TESTED_PYTHON: Final[tuple[int, int]] = (3, 14)
-MAX_TESTED_PATCH: Final[tuple[int, int, int]] = (3, 14, 6)
-SUPPORTED_PYTHONS: Final[tuple[tuple[int, int], ...]] = ((3, 13), (3, 14))
+MIN_PYTHON: Final[tuple[int, int]] = (3, 12)
+MAX_TESTED_PYTHON: Final[tuple[int, int]] = (3, 15)
+MAX_TESTED_PATCH: Final[tuple[int, int, int]] = (3, 15, 0)
+SUPPORTED_PYTHONS: Final[tuple[tuple[int, int], ...]] = ((3, 12), (3, 13), (3, 14), (3, 15))
 
 
 def python_version_tuple() -> tuple[int, int, int]:
@@ -39,7 +39,7 @@ def python_compatibility() -> dict[str, object]:
     if major_minor < MIN_PYTHON:
         status = "unsupported-old"
         supported = False
-        message = "Python 3.13 or 3.14 is required"
+        message = "Python 3.12, 3.13, 3.14 or 3.15 is required"
     elif major_minor in SUPPORTED_PYTHONS:
         if not _gil_enabled():
             status = "unsupported-free-threaded"
@@ -48,7 +48,7 @@ def python_compatibility() -> dict[str, object]:
         else:
             status = "supported"
             supported = True
-            message = "Supported on Python 3.13 and 3.14; target images validated through OpenBH Python 3.14.6"
+            message = "Supported on Python 3.12, 3.13, 3.14 and 3.15 (standard GIL builds); Python 3.15 source/API compatibility audited against CPython 3.15.0rc2"
     else:
         # Future CPython is allowed but reported as untested. Source-only code
         # should not brick plugin discovery just because the image moved ahead.
@@ -63,6 +63,7 @@ def python_compatibility() -> dict[str, object]:
         "tested_min": "%d.%d" % MIN_PYTHON,
         "tested_max": "%d.%d.%d" % MAX_TESTED_PATCH,
         "python314_ready": major_minor == (3, 14),
+        "python315_ready": major_minor == (3, 15),
         "gil_enabled": _gil_enabled(),
     }
 
@@ -77,13 +78,15 @@ def _module_available(name: str) -> bool:
 def dependency_report() -> dict[str, object]:
     """Check imports that correspond to package/runtime requirements.
 
-    sqlite3 and the Enigma2 base modules are fatal because core storage/UI
-    cannot work without them. Pillow is intentionally non-fatal because the UI
-    already has reduced-artwork fallbacks, even though the IPK declares it.
+    sqlite3, Pillow, Twisted and the Enigma2 base modules are fatal because
+    the current artwork and Details/Backdrop UI graph imports them directly.
+    Keep this list aligned with the IPK Depends field so a missing feed package
+    produces a clear startup error instead of a later initialization failure.
     """
     checks = {
         "sqlite3": _module_available("sqlite3"),
         "pillow": _module_available("PIL.Image"),
+        "twisted": all(_module_available(name) for name in ("twisted.internet", "twisted.web.client", "twisted.web.http_headers")),
         "enigma": _module_available("enigma"),
         "components": _module_available("Components"),
         "screens": _module_available("Screens"),
@@ -92,6 +95,10 @@ def dependency_report() -> dict[str, object]:
     fatal = []
     if not checks["sqlite3"]:
         fatal.append("Python sqlite3 (package: python3-sqlite3)")
+    if not checks["pillow"]:
+        fatal.append("Pillow/PIL (package: python3-pillow)")
+    if not checks["twisted"]:
+        fatal.append("Twisted networking (package: python3-twisted)")
     if not checks["enigma"]:
         fatal.append("Enigma2 Python module (enigma)")
     if not checks["components"]:
@@ -101,8 +108,6 @@ def dependency_report() -> dict[str, object]:
     if not checks["plugins"]:
         fatal.append("Enigma2 Plugins package")
     warnings = []
-    if not checks["pillow"]:
-        warnings.append("Pillow/PIL is missing; artwork processing will be limited (package: python3-pillow)")
     return {"checks": checks, "fatal": fatal, "warnings": warnings, "ok": not fatal}
 
 

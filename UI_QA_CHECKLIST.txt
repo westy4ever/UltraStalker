@@ -1,0 +1,38 @@
+Ultra Stalker UI Release Checklist
+Version target: Ultra Stalker Final V9.1.1
+
+Performance
+- Home ui_ready is recorded when diagnostic_logging is enabled.
+- Browser ui_ready is recorded.
+- Grid ui_page_ready and ui_first_art are recorded per page.
+- Details ui_ready is recorded.
+- runtime.log health snapshots include RSS, thread count and open FDs.
+- Endurance guard flags RSS growth >96 MB, threads >8, or FDs >32 over the first UI baseline.
+
+Lifecycle
+- Home: async/image/clock/hero/rebind/background hooks stop on close.
+- Browser: async/image/initial-action/EPG/pixmaps/hooks stop on close.
+- Grid: async/poster workers/watchers/ePicLoad/EPG/focus/detail timers/clock stop on close.
+- Details: async/image/pixmaps/backdrop watcher/hooks/description timers stop on close.
+
+Visual / Behavior Regression
+- Portal screen adaptive glass and status cards unchanged.
+- Home adaptive mood, hero backdrop and 7+3 navigation unchanged.
+- Live grid picons, numbering and page navigation unchanged.
+- Movies and Series clean titles, poster grid and progressive first-paint unchanged.
+- Details adaptive title/overview fonts, poster/backdrop and metadata unchanged.
+- Seasons/Episodes glass layout unchanged.
+- Player hard-stop, configured playback engine, seek and resume unchanged.
+- InfoBar, Mini List, Audio and Subtitle overlays unchanged.
+- Downloads and Info popup unchanged.
+
+Network / Artwork
+- No provider/TMDB/artwork network request executes on the GUI thread.
+- Artwork failure must leave navigation responsive and use async fallback.
+- Security redirect/DNS validation from secfix6 remains enabled.
+
+Receiver acceptance
+- Repeat Home -> Movies -> Details -> Back -> Series -> Live for at least 30 minutes.
+- Flip at least 50 movie/series pages.
+- Open/close player at least 20 times.
+- Verify runtime.log shows no endurance guard warning and no monotonic RSS/FD/thread growth.

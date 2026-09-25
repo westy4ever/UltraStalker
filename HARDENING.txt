@@ -1,68 +1,54 @@
-Ultra Stalker 10.1.0-beta57-rc4-secfix14-ui10
+Ultra Stalker Final V9.1.1
+Runtime hardening baseline
+==========================
 
-Current hardening summary
-- Python 3.13/3.14 runtime compatibility.
-- Bounded artwork/metadata worker pools with centralized shutdown.
-- HDD-first persistent cache with periodic byte-budget pruning.
-- Canonical metadata alias RAM cache bounded to 384 entries.
-- SQLite WAL mode with serialized writers and busy timeout.
-- Player timers/callbacks are torn down on close.
-- Runtime services use bounded shutdown paths.
-- Dynamic bouquet proxy is loopback-only.
+Scope
+- This file documents hardening that exists in the current Final V9.1.1 source tree.
+- It is descriptive, not a claim that client-side code or embedded credentials are tamper-proof.
 
-RC4 maintenance fixes
-1. Removed invalid canonical-alias save call from write_manifest().
-2. Added bounded canonical alias memory cache.
-3. Unified package/internal version metadata.
-4. Removed bundled CPython 3.13 bytecode.
-5. Unified plugin-menu branding to Ultra Stalker.
-6. Refreshed build/support metadata.
-Security fix rc4-secfix1:
-- Live picons keep the configured portal as the only Stalker credential trust origin.
-- Live picons use the SSRF/DNS-pinned SafeMediaRedirectHandler path on every fetch and redirect.
-- Pinned HTTPS handling no longer relies on urllib's private _check_hostname attribute, improving Python 3.13/3.14 compatibility without disabling TLS verification.
+1. Network URL and redirect safety
+- Shared netsec.py validates HTTP(S) URLs before urllib/http.client use.
+- URLs with control characters, backslashes, missing hosts, malformed ports or disallowed userinfo are rejected.
+- Credential-bearing metadata requests require HTTPS.
+- Credential-bearing redirects are HTTPS-only and same-origin; cross-origin credential redirects and HTTPS downgrades are blocked.
+- User-configured provider redirects may cross origin when needed for IPTV/CDN compatibility, but sensitive headers are removed on cross-origin redirects and HTTPS downgrade is blocked.
 
+2. Remote artwork/media fetch safety
+- Remote media targets are resolved and validated before connection.
+- Loopback, link-local, multicast, unspecified and reserved destinations are blocked.
+- Non-global/private destinations are rejected unless they belong to an explicitly trusted configured origin.
+- The validated endpoint set is used by the media connection path to reduce DNS-rebinding/validation-to-connect gaps.
 
-secfix2: M3U/Xtream/probe requests use safer provider redirects; HTTPS downgrade is blocked and cross-origin sensitive headers are stripped. Public Live picons now use the DNS-pinned SSRF-safe media opener with redirect revalidation.
+3. Local state / cache file safety
+- Sensitive/private state paths use restrictive permissions where the current filesystem permits it (0600 files / 0700 private directories in the relevant writers).
+- Important state/cache writes use temporary files plus fsync/replace-style atomic commits rather than in-place partial writes.
+- Settings serialization intentionally removes credential fields so api_keys.conf credentials are not mirrored back into settings.json.
 
-secfix3:
-- TMDB artwork downloads now use the shared DNS-pinned HTTPS media transport.
-- TMDB CDN redirects are constrained to the explicit image.tmdb.org allowlist.
-- Home TMDB artwork no longer falls back to the generic credential opener.
+4. Credential handling
+- User credentials live in /etc/enigma2/ultrastalker/api_keys.conf and override built-in defaults.
+- Built-in TMDb/SubDL/SubSource defaults are stored as obfuscated client payloads, not readable plaintext; this is obfuscation only, not cryptographic secrecy.
+- Legacy TMDb credentials found in settings are migrated to api_keys.conf before the legacy plaintext copy is removed when the filesystem allows the migration.
 
-secfix4:
-- Unified release/version metadata across package and bundled support files.
-- Removed bundled Python bytecode/cache artifacts from the release package.
-- Normalized packaged directory permissions to 0755 (removed unintended setgid bits).
+5. M3U/Xtream cache deserialization
+- The fast M3U cache uses a restricted pickle Unpickler that rejects GLOBAL/class reconstruction.
+- Only plugin-owned plain built-in container/scalar cache data is accepted by that path; arbitrary object reconstruction is not permitted.
 
-secfix5:
-- Applied central secret/URL redaction to direct Live picon diagnostics before disk writes.
-- Applied the same redaction to runtime breadcrumb string fields and artwork trace/log files.
-- Enforced private 0600 permissions on direct diagnostic/artwork log files after writes.
-- Fixed Authorization Bearer/Basic header redaction ordering so credential payloads cannot remain in diagnostics.
+6. Backup / restore integrity
+- Current backup format uses a manifest with SHA-256 validation before restore/commit.
+- Restore validates the archive/content before replacing live state and creates a safety backup in the normal UI workflow.
+- Artwork/poster/backdrop cache is not treated as portable trusted configuration state.
 
-secfix6:
-- Switched package-facing metadata from Developer wording to production-facing Ultra Stalker branding.
-- Narrowed silent broad exceptions on deterministic filesystem, socket, statvfs and integer-conversion paths while preserving fail-soft Enigma2 UI/API boundaries.
-- Kept support-bundle export atomic and private (0600); replacement already removes stale bundle contents without deleting the user's newly exported support file.
-- Revalidated runtime dependencies against imported third-party modules; python3-core, python3-sqlite3 and python3-pillow remain the required package dependencies.
-- Release QA includes full Python source compilation on CPython 3.13 plus archive/permission/security static checks. Enigma2/Python 3.14 receiver smoke testing remains environment-dependent.
+7. Process execution / updater boundary
+- Runtime source does not use shell=True or os.system().
+- Where subprocesses are required (for example the updater), arguments are passed as an argv list rather than through a shell command string.
+- QA/gate scripts may execute local trusted build metadata for validation; they are not network-facing runtime parsers.
 
+8. Package / runtime hygiene expectations
+- Release package must contain no pyc/pyo/__pycache__ or editor/backup junk.
+- Free Portal and Free Xtream catalogues must be packaged as the intended catalogue data rather than generated empty placeholders.
+- Legacy foreign-plugin branding/provenance strings remain a release-gate failure.
 
-UI10 instrumentation pass:
-- Added diagnostic-only UI timing markers for Home, Browser, Grid and Details.
-- Added Grid page-ready and first-real-art latency markers, including folder-local views.
-- Runtime health sampling stays on the asynchronous runtime-log worker.
-- Added passive endurance warnings for RSS growth >96 MB, thread growth >8, or FD growth >32 over first UI baseline.
-- Confirmed artwork/provider/TMDB network work remains off the GUI thread.
-- Added a packaged UI regression/endurance checklist. No layout, worker-count, timer cadence, player behavior or artwork policy was redesigned.
-
-secfix9: Centralized HTTP(S) URL validation across provider, credential and native portal transports. Rejects control characters, backslash parser ambiguity, malformed ports and URL userinfo; credential requests remain HTTPS-only. Cross-origin provider redirects additionally strip X-API-Key/API-Key/X-Auth-Token/X-Access-Token along with Authorization/Cookie/Proxy-Authorization/Referer.
-
-secfix10: Private-media trust is now bound to the exact configured portal origin (scheme + host + port), not hostname alone. Same-host alternate ports/schemes no longer inherit RFC1918/ULA trust; loopback/link-local/reserved targets remain blocked, and DNS-pinned socket validation is preserved across redirects.
-
-secfix11: UI maintainability refactor: raw Enigma2 skin templates were extracted from ui.py into ui_skin_templates.py without changing rendered skin strings. This removes ~74 KB of static XML from the runtime orchestration module and reduces coupling while preserving behavior.
-
-secfix20:
-- Added mandatory run_release_gates.py for download path-containment and one-shot TypeError compatibility regressions.
-- Release gate combines static guard checks with the focused 10-test security/correctness suite; full run_tests.py remains mandatory.
+Known limits / explicit non-claims
+- Obfuscated built-in API credentials can be recovered by a determined analyst with the package and runtime code.
+- User-configured IPTV endpoints may intentionally use plain HTTP for provider compatibility; the plugin cannot add transport security that the provider does not offer.
+- Host-side static checks do not replace physical Enigma2 receiver testing for decoder handoff, filesystem behavior, TLS stack differences, resource leaks or image-specific APIs.

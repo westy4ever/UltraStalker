@@ -1,5 +1,6 @@
 """Grid artwork mixin extracted from ui.py without changing behavior."""
 
+import threading
 import os
 import time
 from .core.runtime_log import diagnostic_breadcrumb as _ui_diag
@@ -7,6 +8,30 @@ from .core.runtime_log import diagnostic_breadcrumb as _ui_diag
 # Runtime dependencies are injected by ui.py after shared caches/executors exist.
 def configure_grid_artwork(**deps):
     globals().update(deps)
+
+def _live_picon_candidates(item):
+    """Return ordered usable Live logo fields without placeholder values.
+
+    Some providers publish a dead stream_icon while a working picon/logo field is
+    present on the same row.  The old first-field-only path then painted the
+    placeholder forever.  Keep this Live-only and bounded.
+    """
+    if not isinstance(item,dict):
+        return []
+    out=[]
+    for key in ("stream_icon","picon","logo","logo_url","image","img","pic","cover","cover_url"):
+        value=item.get(key)
+        values=value if isinstance(value,(list,tuple)) else [value]
+        for entry in values:
+            text=str(entry or "").strip()
+            low=text.casefold()
+            if not text or low in ("null","none","[]","{}"):
+                continue
+            if any(tag in low for tag in ("placeholder","noimage","no_image","default_poster","default-cover")):
+                continue
+            if text not in out:
+                out.append(text)
+    return out
 
 class GridArtworkMixin:
     """Bounded three-page artwork cache with one sequential OpenBH decoder."""
@@ -30,6 +55,7 @@ class GridArtworkMixin:
         self._grid_waiting = {}
         self._grid_queued = set()
         self._grid_slot_paths = {}
+        self._grid_slot_identities = {}
         self._grid_palette_sources = {}
         self._grid_accent_jobs = queue.Queue()
         self._grid_accent_pending = set()
@@ -187,11 +213,12 @@ class GridArtworkMixin:
         if token in self._grid_accent_pending:
             return
         self._grid_accent_pending.add(token)
-        # Every visible card gets one normal adaptive chrome. Focus never
-        # repaints the card itself; only the independent selection overlay changes.
+        # Release: every visible poster gets a NORMAL card chrome plus a separate
+        # adaptive focus overlay. The card never changes just because it is
+        # selected; this removes the redraw pulse seen under the focus frame.
         def worker():
-            card=_grid_card_chrome_from_poster(path)
-            result=_grid_selection_asset_from_poster(path) if selected_now else None
+            card=_grid_card_chrome_from_poster(path,selected=False)
+            result=_grid_selection_asset_from_poster(path)
             try:self._grid_accent_jobs.put((generation,slot,path,result,card,None))
             except Exception as exc:optional_failure("ui.silent_guard",exc)
         try:_GRID_ACCENT_EXECUTOR.submit(worker)
@@ -210,88 +237,113 @@ class GridArtworkMixin:
             except Exception as exc:optional_failure("ui.grid_accent_pending_cleanup",exc)
             if generation != self._grid_generation:
                 continue
-            if card and (getattr(self,"_grid_palette_sources",{}).get(slot) or self._grid_slot_paths.get(slot))==path:
+            if card and slot != getattr(self,"index",-1) and (getattr(self,"_grid_palette_sources",{}).get(slot) or self._grid_slot_paths.get(slot))==path:
                 try:
                     if not hasattr(self,"_grid_card_paths"):self._grid_card_paths={}
                     self._grid_card_paths[slot]=card
                     try:
-                        if hasattr(self,"_remember_grid_visual"):
-                            self._remember_grid_visual(slot,palette=path,card=card)
-                        if 0<=slot<len(getattr(self,"grid_items",[]) or []):
-                            _save_visual_bundle(self.profile,self.media_type,self.grid_items[slot],{"poster":path,"grid_card":card},snapshot=load_detail_snapshot(self.profile,self.media_type,self.grid_items[slot]))
-                    except Exception as exc:optional_failure("ui.grid_visual_persist_card",exc)
+                        if hasattr(self,"_remember_grid_visual"):self._remember_grid_visual(slot,palette=path,card=card)
+                    except Exception as exc:optional_failure("ui.grid_visual_ram_card",exc)
                     name="card_chrome%d"%slot
                     widget=self[name]
                     if widget.instance is not None:widget.instance.setPixmapFromFile(card);widget.show()
                 except Exception as exc:optional_failure("ui.grid_adaptive_card_apply",exc)
             if result and slot == getattr(self,"index",-1) and (getattr(self,"_grid_palette_sources",{}).get(slot) or self._grid_slot_paths.get(slot)) == path:
                 try:
-                    # One visual swap only. Re-applying the same PNG can make
-                    # OpenBH briefly rebuild the pixmap surface and look like a blink.
-                    if result != getattr(self,"_grid_selection_visual_path",""):
-                        self["selection"].instance.setPixmapFromFile(result)
-                        self._grid_selection_visual_path=result
-                        changed=True
+                    # Dual-layer focus: the thick base selector below is
+                    # never replaced. Adaptive colour swaps only on the overlay,
+                    # so an OpenBH blank frame cannot make focus disappear.
+                    # The queued result may resolve to the same cached path that
+                    # was previously bound. Rebind it anyway: the native Enigma2
+                    # surface can be gone even though our path marker still matches.
+                    if self["selection_adaptive"].instance is not None:
+                        self["selection_adaptive"].instance.setPixmap(None)
+                        self["selection_adaptive"].instance.setPixmapFromFile(result)
+                    self._grid_selection_adaptive_visual_path=result
+                    changed=True
+                    self["selection_adaptive"].show()
                     self["selection"].show()
-                    try:
-                        if 0<=slot<len(getattr(self,"grid_items",[]) or []):
-                            _save_visual_bundle(self.profile,self.media_type,self.grid_items[slot],{"poster":path,"grid_selection":result},snapshot=load_detail_snapshot(self.profile,self.media_type,self.grid_items[slot]))
-                    except Exception as persist_exc:optional_failure("ui.grid_visual_persist_selection",persist_exc)
+                    self._grid_focus_chrome_slot=slot
                 except Exception as exc:optional_failure("ui.grid_adaptive_selector_apply",exc)
         return changed
 
-    def _grid_apply_current_selector(self):
+    def _grid_mood_target(self,path):
+        try:
+            st=os.stat(str(path));stamp="%s|%s"%(int(getattr(st,"st_mtime_ns",int(st.st_mtime*1e9))),int(st.st_size))
+            key=hashlib.sha1((str(path)+"|"+stamp+"|grid-page-mood-v8-stable").encode("utf-8","ignore")).hexdigest()
+            return os.path.join(THUMB_CACHE_DIR,"gridmood_%s_960x540_v8_stable.jpg"%key)
+        except Exception:return ""
+
+    def _grid_apply_current_selector(self, allow_build=False):
         if getattr(self,"media_type",None) not in ("vod","series"):
             return
         slot=getattr(self,"index",0)
         path=getattr(self,"_grid_palette_sources",{}).get(slot) or self._grid_slot_paths.get(slot)
+
+        # Permanent thick base focus: this pixmap is never swapped while browsing.
+        try:
+            stable=asset(getattr(self,"selection_asset","poster_card_selected_neutral_small.png"))
+            if getattr(self,"_grid_selection_visual_path","") != stable:
+                self["selection"].instance.setPixmapFromFile(stable)
+                self._grid_selection_visual_path=stable
+            self["selection"].show()
+        except Exception as exc:optional_failure("ui.grid_selector_stable",exc)
+
         if not path or not os.path.isfile(path):
+            try:self["selection_adaptive"].hide()
+            except Exception:pass
             return
 
-        # CACHE-ONLY browsing. Blue Cache Artwork is the only code path allowed
-        # to create adaptive card/laser/mood assets.
+        # Adaptive colour lives on a second overlay. Cached assets switch
+        # immediately during navigation; a cache miss leaves the thick base
+        # visible and queues the overlay without ever blanking focus.
         try:
             stamp=str(int(os.path.getmtime(path)))
-            sel_key=hashlib.sha1((path+"|"+stamp+"|us-card-select-v8-no-reflection-arc").encode("utf-8","ignore")).hexdigest()
-            ready=_GRID_ACCENT_CACHE.get(sel_key) or os.path.join(THUMB_CACHE_DIR,"selcard_%s_266x398_v8.png"%sel_key)
+            sel_key=hashlib.sha1((path+"|"+stamp+"|us-card-select-v12-thickoutside-222x398").encode("utf-8","ignore")).hexdigest()
+            ready=_GRID_ACCENT_CACHE.get(sel_key) or os.path.join(THUMB_CACHE_DIR,"selcard_%s_222x398_v12.png"%sel_key)
             if ready and _valid_cache_file(ready,ttl=0):
-                if ready != getattr(self,"_grid_selection_visual_path",""):
-                    self["selection"].instance.setPixmapFromFile(ready);self._grid_selection_visual_path=ready
-                self["selection"].show()
+                # Rebind cached adaptive focus even when the source marker is
+                # unchanged. OpenBH can drop the native pixmap surface across
+                # hide/show or child transitions while our Python-side path
+                # still points at the same cached asset.
+                if self["selection_adaptive"].instance is not None:
+                    self["selection_adaptive"].instance.setPixmap(None)
+                    self["selection_adaptive"].instance.setPixmapFromFile(ready)
+                self._grid_selection_adaptive_visual_path=ready
+                self["selection_adaptive"].show()
             else:
-                # Keep the previous overlay visible until this poster's adaptive
-                # overlay is ready, then _grid_drain_adaptive_selector swaps once.
-                self._grid_schedule_adaptive_selector(self._grid_generation,slot,path)
-        except Exception as exc:optional_failure("ui.grid_selector_cache_only",exc)
+                self["selection_adaptive"].hide()
+                if allow_build:
+                    self._grid_schedule_adaptive_selector(self._grid_generation,slot,path)
+        except Exception as exc:optional_failure("ui.grid_selector_adaptive_overlay",exc)
 
         try:
-            mood_key=hashlib.sha1((path+"|"+stamp+"|grid-page-mood-v5-lowmem").encode("utf-8","ignore")).hexdigest()
-            mood=os.path.join(THUMB_CACHE_DIR,"gridmood_%s_960x540_v5.jpg"%mood_key)
-            if _valid_cache_file(mood,ttl=0) and mood!=getattr(self,"_grid_mood_source",""):
+            mood=self._grid_mood_target(path)
+            if mood and _valid_cache_file(mood,ttl=0):
+                # Rebind even when the source did not change. OpenBH can drop the
+                # full-screen pixmap across page/child transitions while retaining
+                # our Python-side source marker.
                 self["page_adaptive_bg"].instance.setPixmap(None);self["page_adaptive_bg"].instance.setPixmapFromFile(mood)
                 self["page_adaptive_bg"].show();self._grid_mood_source=path
-            elif not _valid_cache_file(mood,ttl=0):
-                # Keep navigation non-blocking: build a missing page mood once in
-                # the existing background executor, then reuse it from HDD on
-                # every later visit/selection. No palette work runs on the UI thread.
+            elif allow_build:
                 self._grid_schedule_page_mood(path)
         except Exception as exc:optional_failure("ui.grid_mood_cache_only",exc)
 
     def _grid_schedule_page_mood(self,path):
-        if getattr(self,"media_type",None) not in ("vod","series") or not path or not os.path.isfile(path): return
+        if getattr(self,"media_type",None) not in ("vod","series") or not path or not os.path.isfile(path):return
         path=str(path)
-        if self._grid_mood_source==path or self._grid_mood_pending==path: return
         try:
-            stamp=str(int(os.path.getmtime(path)));key=hashlib.sha1((path+"|"+stamp+"|grid-page-mood-v5-lowmem").encode("utf-8","ignore")).hexdigest();target=os.path.join(THUMB_CACHE_DIR,"gridmood_%s_960x540_v5.jpg"%key)
-            if _valid_cache_file(target,ttl=0):
+            target=self._grid_mood_target(path)
+            if target and _valid_cache_file(target,ttl=0):
                 self["page_adaptive_bg"].instance.setPixmap(None);self["page_adaptive_bg"].instance.setPixmapFromFile(target);self["page_adaptive_bg"].show();self._grid_mood_source=path;return
-        except Exception as exc: optional_failure("ui.grid_mood_cache",exc)
+        except Exception as exc:optional_failure("ui.grid_mood_cache",exc)
+        if self._grid_mood_pending==path:return
         self._grid_mood_pending=path;self._grid_mood_token+=1;token=self._grid_mood_token
         def worker():
             out=_grid_page_mood_from_poster(path)
             try:self._grid_mood_jobs.put((token,path,out))
             except Exception as exc:optional_failure("ui.silent_guard",exc)
-        try:_GRID_ACCENT_EXECUTOR.submit(worker)
+        try:_GRID_MOOD_EXECUTOR.submit(worker)
         except Exception:
             if self._grid_mood_pending==path:self._grid_mood_pending=""
 
@@ -306,11 +358,6 @@ class GridArtworkMixin:
             if current!=path or not result:continue
             try:
                 self["page_adaptive_bg"].instance.setPixmap(None);self["page_adaptive_bg"].instance.setPixmapFromFile(result);self["page_adaptive_bg"].show();self._grid_mood_source=path
-                try:
-                    slot=getattr(self,"index",0)
-                    if 0<=slot<len(getattr(self,"grid_items",[]) or []):
-                        _save_visual_bundle(self.profile,self.media_type,self.grid_items[slot],{"poster":path,"grid_mood":result},snapshot=load_detail_snapshot(self.profile,self.media_type,self.grid_items[slot]))
-                except Exception as persist_exc:optional_failure("ui.grid_visual_persist_mood",persist_exc)
             except Exception as exc:optional_failure("ui.grid_mood_apply",exc)
 
     def _grid_download_future_done(self, future):
@@ -341,7 +388,11 @@ class GridArtworkMixin:
     def _grid_poster_thumb_path(self, source_path):
         try:
             st=os.stat(source_path)
-            raw="%s|%s|%s|%sx%s|us-card-cover-v4"%(source_path,int(st.st_mtime),int(st.st_size),int(self._grid_image_size[0]),int(self._grid_image_size[1]))
+            if getattr(self,"_poster_small_fill",False):
+                mode_tag="us-card-smallfill-v1"
+            else:
+                mode_tag="us-card-cover-v4" if getattr(self,"_poster_cover_mode",False) else "us-card-fit-v1"
+            raw="%s|%s|%s|%sx%s|%s"%(source_path,int(st.st_mtime),int(st.st_size),int(self._grid_image_size[0]),int(self._grid_image_size[1]),mode_tag)
             digest=hashlib.sha1(raw.encode("utf-8","ignore")).hexdigest()
             return os.path.join(THUMB_CACHE_DIR,"gridposter_%s_%dx%d.png"%(digest,int(self._grid_image_size[0]),int(self._grid_image_size[1])))
         except Exception:
@@ -370,6 +421,10 @@ class GridArtworkMixin:
         if _PILImage is None or not thumb:
             self._grid_queue_decode(generation,slot,source_path)
             return True
+        # Test67: never hold first paint behind the single Pillow lane. Decode the
+        # already-downloaded original immediately; build the small persistent thumb
+        # silently for the next open.
+        self._grid_queue_decode(generation,slot,source_path)
         token=(generation,slot,thumb)
         pending=getattr(self,"_grid_poster_thumb_pending",None)
         if pending is None:
@@ -382,19 +437,13 @@ class GridArtworkMixin:
             try:
                 if self._grid_closed or generation!=self._grid_generation:
                     return
-                out=(_build_cover_thumbnail(source_path,thumb,self._grid_image_size) if getattr(self,"_poster_cover_mode",False) else _build_thumbnail(source_path,thumb,self._grid_image_size))
-                try:
-                    if 0<=slot<len(getattr(self,"grid_items",[]) or []):
-                        card=_grid_card_chrome_from_poster(source_path)
-                        _save_visual_bundle(self.profile,self.media_type,self.grid_items[slot],{"poster":source_path,"grid_thumb":out or thumb,"grid_card":card},snapshot=load_detail_snapshot(self.profile,self.media_type,self.grid_items[slot]))
-                except Exception as exc:optional_failure("ui.grid_bundle_build",exc)
+                out=(_build_cover_thumbnail(source_path,thumb,self._grid_image_size) if (getattr(self,"_poster_small_fill",False) or getattr(self,"_poster_cover_mode",False)) else _build_thumbnail(source_path,thumb,self._grid_image_size))
             finally:
                 try: pending.discard(token)
                 except Exception as exc: optional_failure("ui.grid_pending_cleanup", exc)
-            try:
-                self._grid_download_jobs.put((generation,slot,out or source_path))
-            except Exception as exc:
-                optional_failure("ui.silent_guard",exc)
+            # Original was already queued for first paint above. Do not swap it
+            # again when the thumb finishes; that second decode caused visible
+            # one-by-one repaint/flicker. The thumb is for future opens only.
         try:
             _POSTER_THUMB_EXECUTOR.submit(worker)
         except Exception:
@@ -409,7 +458,8 @@ class GridArtworkMixin:
             return
         if getattr(self, "media_type", None) in ("vod", "series"):
             prepared_map=(getattr(self,"_grid_prepared_art",{}) or {})
-            if slot in prepared_map:
+            prepared_seen=(slot in prepared_map)
+            if prepared_seen:
                 prepared=prepared_map.get(slot) or {}
                 display=str(prepared.get("display") or "")
                 poster=str(prepared.get("poster") or "")
@@ -431,65 +481,86 @@ class GridArtworkMixin:
                         self._grid_visual_locks[slot]=poster
                     self._grid_use_persistent_poster(generation,slot,poster)
                     return
-                self._grid_set_local(slot,asset(placeholder));return
+                # No local poster yet. Paint the placeholder now, but DO NOT
+                # return: the visible-page direct provider path below is allowed
+                # to fetch the catalogue poster automatically. This is display
+                # hydration only; it never invokes Xtream enrichment or TMDB.
+                self._grid_set_local(slot,asset(placeholder))
             # Cold fallback exists only for legacy/non-prepared paths.
-            try:
-                snap=(load_shared_detail_snapshot(self.profile,self.media_type,item)
-                      if isinstance(item,dict) and item.get("_xtream")
-                      else load_detail_snapshot(self.profile,self.media_type,item))
-                bundle=_load_visual_bundle(self.profile,self.media_type,item,snap)
-                bundled=str((bundle or {}).get("grid_thumb") or (bundle or {}).get("poster") or "")
-                if bundled and os.path.isfile(bundled):
-                    palette=str((bundle or {}).get("poster") or bundled)
-                    if not hasattr(self,"_grid_palette_sources"):self._grid_palette_sources={}
-                    self._grid_palette_sources[slot]=palette
-                    self._grid_queue_decode(generation,slot,bundled)
-                    # Apply already-generated card chrome; never rebuild it on reopen.
-                    card=str((bundle or {}).get("grid_card") or "")
-                    if card and os.path.isfile(card):
-                        self._grid_card_paths[slot]=card
-                        try:
-                            self["card_chrome%d"%slot].instance.setPixmapFromFile(card);self["card_chrome%d"%slot].show()
-                        except Exception as exc:optional_failure("ui.silent_guard",exc)
-                    return
-            except Exception as exc:optional_failure("ui.grid_visual_bundle",exc)
-            try:
-                # Artwork v2 owns the poster hot path. It is a direct HDD lookup
-                # and never inspects portal artwork or legacy image caches.
-                snap = load_artwork_v2_manifest(self.profile, self.media_type, item)
-                if (not isinstance(snap,dict) or not snap.get("poster_local")) and isinstance(item,dict) and item.get("_xtream"):
-                    snap = load_shared_detail_snapshot(self.profile,self.media_type,item)
-                local = str((snap or {}).get("poster_local") or "")
-                if local and os.path.isfile(local) and os.path.getsize(local) > 100:
-                    self._grid_use_persistent_poster(generation, slot, local)
-                    return
-            except Exception as exc:
-                optional_failure("ui.grid_hdd_poster_v2", exc)
+            if not prepared_seen:
+                try:
+                    snap=(load_shared_detail_snapshot(self.profile,self.media_type,item)
+                          if isinstance(item,dict) and item.get("_xtream")
+                          else load_detail_snapshot(self.profile,self.media_type,item))
+                    bundle=_load_visual_bundle(self.profile,self.media_type,item,snap)
+                    bundled=str((bundle or {}).get("grid_thumb") or (bundle or {}).get("poster") or "")
+                    if bundled and os.path.isfile(bundled):
+                        palette=str((bundle or {}).get("poster") or bundled)
+                        if not hasattr(self,"_grid_palette_sources"):self._grid_palette_sources={}
+                        self._grid_palette_sources[slot]=palette
+                        self._grid_queue_decode(generation,slot,bundled)
+                        card=str((bundle or {}).get("grid_card") or "")
+                        if card and os.path.isfile(card):
+                            self._grid_card_paths[slot]=card
+                            try:
+                                self["card_chrome%d"%slot].instance.setPixmapFromFile(card);self["card_chrome%d"%slot].show()
+                            except Exception as exc:optional_failure("ui.silent_guard",exc)
+                        return
+                except Exception as exc:optional_failure("ui.grid_visual_bundle",exc)
+                try:
+                    snap = load_artwork_v2_manifest(self.profile, self.media_type, item)
+                    if (not isinstance(snap,dict) or not snap.get("poster_local")) and isinstance(item,dict) and item.get("_xtream"):
+                        snap = load_shared_detail_snapshot(self.profile,self.media_type,item)
+                    local = str((snap or {}).get("poster_local") or "")
+                    if local and os.path.isfile(local) and os.path.getsize(local) > 100:
+                        self._grid_use_persistent_poster(generation, slot, local)
+                        return
+                except Exception as exc:
+                    optional_failure("ui.grid_hdd_poster_v2", exc)
             if slot not in getattr(self, "_grid_slot_paths", {}):
                 self._grid_set_local(slot, asset(placeholder))
-            # Provider-first list policy: ALL Movies/Series may use their server
-            # poster immediately. TMDB remains an asynchronous quality/metadata
-            # upgrade and never blocks the first visible paint.
-        # Direct provider-art path: Live picons and Movies/Series provider covers.
-        raw_art=(None if (self.media_type in ("vod","series") and item.get("_generic_provider_art")) else _image_url(item))
+            # R231: do NOT return here.  Cold VOD/Series cards fall through to
+            # the display-only provider first-paint hedge below.  The canonical
+            # ArtworkV2/TMDb page hydrator still starts after first paint, but it
+            # now runs on its own executor lane.  Whichever source completes first
+            # can paint; canonical artwork keeps final authority.
+        # Visible provider first-paint hedge.  Stalker list artwork is kept in the
+        # private _visible_provider_art_url field while Xtream retains its normal
+        # provider cover. Generic/repeated placeholders are explicitly rejected.
+        if self.media_type in ("vod","series"):
+            raw_art=(None if item.get("_generic_provider_art") else (item.get("_visible_provider_art_url") or _image_url(item)))
+            live_candidates=[]
+        else:
+            live_candidates=_live_picon_candidates(item)
+            raw_art=(live_candidates[0] if live_candidates else _image_url(item))
         if self.media_type=="itv":
-            # HDD-only page-render hot path. This runs only while a page is being
-            # painted, never on every UP/DOWN keypress, so it cannot race Live
-            # selection navigation. Cached picons bypass the placeholder entirely.
-            cached_live=_cached_live_picon_path(raw_art,self._grid_profile,item)
-            if cached_live:
-                self._grid_slot_paths[slot]=cached_live
-                self._grid_palette_sources[slot]=cached_live
-                self._grid_set_local(slot,cached_live)
-                return
+            # HDD-first across all provider logo fields. A stale stream_icon must
+            # not hide a valid picon/logo already present on the same catalogue row.
+            for _raw_live in (live_candidates or [raw_art]):
+                cached_live=_cached_live_picon_path(_raw_live,self._grid_profile,item)
+                if cached_live:
+                    self._grid_slot_paths[slot]=cached_live
+                    self._grid_palette_sources[slot]=cached_live
+                    self._grid_set_local(slot,cached_live)
+                    return
         if slot not in getattr(self, "_grid_slot_paths", {}):
             self._grid_set_local(slot, asset(placeholder))
         url = _optimized_artwork_url(self._grid_absolute_url(raw_art, item), False)
+        live_urls=[]
         if self.media_type=="itv":
+            for _raw_live in (live_candidates or [raw_art]):
+                try:
+                    _resolved=_optimized_artwork_url(self._grid_absolute_url(_raw_live,item),False)
+                except Exception:
+                    _resolved=None
+                if _resolved and _resolved not in live_urls:
+                    live_urls.append(_resolved)
+            if live_urls:
+                url=live_urls[0]
             try:
-                LOG.info("Live picon route channel=%r raw=%r resolved=%r",
+                LOG.info("Live picon route channel=%r raw=%r resolved=%r candidates=%d",
                          str((item or {}).get("name") or (item or {}).get("title") or ""),
-                         raw_art,url)
+                         raw_art,url,len(live_urls))
             except Exception:
                 pass
             if not url:
@@ -511,7 +582,13 @@ class GridArtworkMixin:
                 try:
                     acquired=self._grid_slots.acquire(True,12)
                     if not acquired or self._grid_closed or getattr(self,"_screen_closed",False):return
-                    path=_download_live_portal_temp_picon(url,self._grid_profile,self._grid_client,item=item,timeout=5.5)
+                    path=None
+                    # At most three catalogue-provided candidates, and only when
+                    # the previous one failed. Successful cache/download remains one request.
+                    for _candidate_url in (live_urls or [url])[:3]:
+                        path=_download_live_portal_temp_picon(_candidate_url,self._grid_profile,self._grid_client,item=item,timeout=5.5)
+                        if path and os.path.isfile(path):
+                            break
                     _live_restart_trace("picon_worker_result",channel=channel,slot=int(slot),generation=int(generation),
                                         ok=bool(path and os.path.isfile(path)),path=path or "")
                     if not path or not os.path.isfile(path):raise ValueError("persistent live picon returned no local file")
@@ -548,9 +625,16 @@ class GridArtworkMixin:
             if self.media_type=="itv":
                 try:LOG.info("Live picon cache hit channel=%r path=%s",str((item or {}).get("name") or ""),thumb)
                 except Exception:pass
-            self._grid_queue_decode(generation, slot, thumb);return
+                self._grid_queue_decode(generation, slot, thumb);return
+            # VOD/Series: cached provider bytes are a normal first-paint source.
+            original = _find_original_artwork(digest)
+            if original and os.path.isfile(original):
+                self._grid_use_persistent_poster(generation,slot,original);return
+            self._grid_queue_decode(generation,slot,thumb);return
         original = _find_original_artwork(digest)
         if original:
+            if self.media_type in ("vod","series"):
+                self._grid_use_persistent_poster(generation,slot,original);return
             self._grid_queue_decode(generation, slot, original);_queue_thumbnail_build(original, thumb, self._grid_image_size);return
         with self._grid_download_lock:
             waiters = self._grid_download_inflight.get(url)
@@ -585,19 +669,18 @@ class GridArtworkMixin:
                     display_path=_build_thumbnail(path,thumb,self._grid_image_size) or path
                     _clear_artwork_failure(url)
                 else:
-                    # Reuse the exact provider-artwork pipeline used elsewhere.
-                    # This handles headers/redirects/formats consistently and avoids
-                    # a second slower downloader implementation in the grid.
-                    path=_download_portal_artwork(raw_art,self._grid_profile,self._grid_client,False,2.2,item=item)
+                    # Test67: direct catalogue/provider poster is allowed for the
+                    # VISIBLE page only. This is not Poster Rescue: no Xtream rich
+                    # info, no TMDB, no backdrop, no adjacent-page walk.
+                    path=_download_portal_artwork(raw_art,self._grid_profile,self._grid_client,False,2.5,item=item)
                     if not path or not os.path.isfile(path):
-                        raise ValueError("provider artwork pipeline returned no poster")
-                    display_path=(_build_cover_thumbnail(path,thumb,self._grid_image_size)
-                                  if getattr(self,"_poster_cover_mode",False)
-                                  else _build_thumbnail(path,thumb,self._grid_image_size)) or path
+                        raise ValueError("provider poster returned no local file")
+                    display_path=path
                     _clear_artwork_failure(url)
                 with self._grid_download_lock:completed_waiters=list(self._grid_download_inflight.pop(url,set([(generation,slot)])))
                 if not self._grid_closed and not getattr(self,"_screen_closed",False):
-                    for waiter_generation,waiter_slot in completed_waiters:self._grid_download_jobs.put((waiter_generation,waiter_slot,display_path))
+                    for waiter_generation,waiter_slot in completed_waiters:
+                        self._grid_download_jobs.put((waiter_generation,waiter_slot,display_path,("provider" if self.media_type in ("vod","series") else "plain")))
             except Exception as exc:
                 if acquired:_record_artwork_failure(url)
                 if self.media_type=="itv":
@@ -618,7 +701,8 @@ class GridArtworkMixin:
                         if _persistent_write_ok(temp): os.unlink(temp)
                     except OSError:pass
         try:
-            future=_IMAGE_EXECUTOR.submit(worker)
+            executor=(_VISIBLE_PROVIDER_POSTER_EXECUTOR if self.media_type in ("vod","series") else _IMAGE_EXECUTOR)
+            future=executor.submit(worker)
             with self._grid_download_lock:self._grid_download_futures[future]=url
             future.add_done_callback(self._grid_download_future_done)
         except Exception:
@@ -630,12 +714,28 @@ class GridArtworkMixin:
             if limit is not None and count>=max(1,int(limit)):
                 break
             try:
-                generation, slot, path = self._grid_download_jobs.get_nowait()
+                job=self._grid_download_jobs.get_nowait()
+                generation,slot,path=job[0],job[1],job[2]
+                kind=(job[3] if len(job)>3 else "plain")
             except queue.Empty:
                 break
             if generation != self._grid_generation:
                 continue
-            self._grid_queue_decode(generation, slot, path)
+            if kind=="provider" and getattr(self,"media_type",None) in ("vod","series") and path and os.path.isfile(path):
+                # R231 canonical-wins gate. Provider art is a first-paint hedge,
+                # never a late downgrade. If canonical ArtworkV2 already painted
+                # this slot, keep it and merely retain the downloaded provider file
+                # in the shared source cache for future cold opens.
+                canonical=(getattr(self,"_grid_canonical_poster_slots",{}) or {}).get(slot)
+                if canonical and os.path.isfile(str(canonical)):
+                    count+=1
+                    continue
+                self._grid_palette_sources[slot]=path
+                try:self._remember_grid_visual(slot,poster=path,palette=path,provider_locked=True)
+                except Exception:pass
+                self._grid_use_persistent_poster(generation,slot,path)
+            else:
+                self._grid_queue_decode(generation, slot, path)
             count+=1
         self._grid_start_decode()
 
@@ -700,6 +800,7 @@ class GridArtworkMixin:
         self._grid_waiting = {}
         self._grid_queued = set()
         self._grid_slot_paths = {}
+        self._grid_slot_identities = {}
         self._grid_accent_jobs = queue.Queue()
         self._grid_accent_pending = set()
         self._grid_poster_thumb_pending = set()

@@ -1,0 +1,3 @@
+PLUGIN_VERSION = "9.1.1"
+PLUGIN_BUILD = 911
+BUILD_NAME = "Ultra Stalker Final V9.1.1"

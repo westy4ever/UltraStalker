@@ -1,6 +1,9 @@
 """Dynamic artwork palette extraction shared by UltraStalker UI chrome builders."""
 
-import colorsys
+try:
+    import colorsys
+except Exception:
+    from . import compat_colorsys as colorsys
 import os
 import threading
 from collections import OrderedDict
@@ -12,11 +15,14 @@ except Exception:
     _PILImageOps = None
 
 from .log import optional_failure
+from .media_library import adaptive_palette_for_path
+from .core.image_budget import image_budgeted
 
 _DYNAMIC_PALETTE_CACHE = OrderedDict()
 _DYNAMIC_PALETTE_CACHE_LOCK = threading.RLock()
 _DYNAMIC_PALETTE_CACHE_LIMIT = 256
 
+@image_budgeted
 def _dynamic_palette(source_path):
     """Extract and session-cache two safe accent colours from artwork.
 
@@ -24,7 +30,14 @@ def _dynamic_palette(source_path):
     Cache by path + mtime + size so all of those surfaces reuse one extraction
     without risking stale colours when the poster file changes.
     """
-    if _PILImage is None or not source_path or not os.path.isfile(source_path):
+    if not source_path or not os.path.isfile(source_path):
+        return ((8, 34, 52), (5, 19, 31))
+    # Global library palette is authoritative. Never re-sample the same TMDB
+    # title differently on Grid, Details, Home or any future presentation.
+    persisted=adaptive_palette_for_path(source_path)
+    if persisted:
+        return persisted
+    if _PILImage is None:
         return ((8, 34, 52), (5, 19, 31))
     cache_key=None
     try:

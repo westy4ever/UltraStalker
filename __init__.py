@@ -1,34 +1,10 @@
 # -*- coding: utf-8 -*-
-import gettext
-import os
+"""Ultra Stalker package localization entry point.
 
-PLUGIN_DOMAIN = "UltraStalker"
-LOCALE_DIR = os.path.join(os.path.dirname(__file__), "locale")
+The plugin language is intentionally independent from Enigma2's global
+language. Only strings explicitly marked with ``_()`` are translated; provider
+content is left byte-for-byte/display-for-display as supplied by the source.
+"""
+from .localization import translate as _, current_language, language_name, set_plugin_language
 
-def localeInit():
-    try:
-        from Components.Language import language
-        lang = (language.getLanguage() or "en")[:2]
-        os.environ["LANGUAGE"] = lang
-    except Exception:
-        pass
-    try:
-        gettext.bindtextdomain(PLUGIN_DOMAIN, LOCALE_DIR)
-    except Exception:
-        pass
-
-localeInit()
-try:
-    from Components.Language import language
-    language.addCallback(localeInit)
-except Exception:
-    pass
-
-def _(text):
-    try:
-        return gettext.dgettext(PLUGIN_DOMAIN, text)
-    except Exception:
-        try:
-            return gettext.translation(PLUGIN_DOMAIN, LOCALE_DIR, fallback=True).gettext(text)
-        except Exception:
-            return text
+__all__ = ["_", "current_language", "language_name", "set_plugin_language"]

@@ -38,6 +38,11 @@ from .core.errors import (
 )
 from .log import get_logger
 from .netsec import validate_http_url
+from .portal_compat import (
+    EMULATOR_USER_AGENT, MAX_FRONTEND_BYTES, compatibility_state_key,
+    compatible_identity, endpoint_log_label, extract_declared_endpoints,
+    frontend_candidates, portal_roots, same_origin,
+)
 
 LOG = get_logger()
 
@@ -248,11 +253,20 @@ class StalkerClient:
         self.play_token = ""
         self.profile_initialized = False
         self.account_valid = False
+        # Live link policy learned from the authenticated portal profile/catalogue.
+        # Keep it session-local; no credentials or stream URLs are persisted here.
+        self._live_force_link_check = False
 
         self.cookies = http.cookiejar.CookieJar()
         self.opener = self._build_opener(verified=True)
         self._transport_local = threading.local()
         self._transport_lock = threading.RLock()
+        # Playback/auth coordination is deliberately separate from transport IO.
+        # A user Play action must not race a background metadata worker that is
+        # refreshing the shared MAG token, and it must not inherit a temporary
+        # background circuit pause.  RLock keeps nested authorize/reset calls safe.
+        self._auth_lock = threading.RLock()
+        self._priority_local = threading.local()
         self._transport_connections = {}
         self._transport_generation = 0
         self._server_cookies = {}
@@ -269,7 +283,19 @@ class StalkerClient:
         self._timezone = self._local_timezone()
         self._persisted_endpoint = None
         self._persisted_device_profile = None
+        self._compat_state = {}
+        self._compat_cached_endpoint = ""
+        self._compat_cached_method = ""
+        self._compat_cached_profile_variant = ""
+        self._compat_cached_ua_variant = ""
+        self._compat_use_emulator_ua = False
+        self._compat_mac_override = ""
+        self._compat_discovery_attempted = False
+        self._compat_discovered_candidates = []
+        self._compat_endpoint_methods = {}
         self._load_transport_state()
+        self._load_compat_state()
+        self._content_cache_generation = self._load_content_cache_generation()
 
 
     @staticmethod
@@ -397,6 +423,99 @@ class StalkerClient:
             LOG.debug("Could not persist portal transport state: %s", exc)
 
 
+    def _compat_state_key(self):
+        return compatibility_state_key(self._state_entry_url)
+
+    def _load_compat_state(self):
+        """Load non-secret compatibility discoveries shared by one portal root."""
+        try:
+            state = DB.state_get(self._compat_state_key())
+        except Exception:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        self._compat_state = dict(state)
+        endpoint = str(state.get("endpoint") or "").strip()
+        method = str(state.get("method") or "").strip().upper()
+        profile_variant = str(state.get("profile_variant") or "").strip().lower()
+        ua_variant = str(state.get("ua_variant") or "").strip().lower()
+        if endpoint:
+            try:
+                ep = urllib.parse.urlsplit(endpoint)
+                if same_origin(endpoint, self.entry_url) and ep.path.lower().endswith(".php"):
+                    self._compat_cached_endpoint = endpoint.rstrip("/")
+                    if method in ("GET", "POST"):
+                        self._compat_cached_method = method
+                        self._compat_endpoint_methods[self._compat_cached_endpoint] = method
+            except Exception:
+                self._compat_cached_endpoint = ""
+        if profile_variant in (
+            "random_upper", "random_lower", "random_upper_emulator", "random_lower_emulator"
+        ):
+            self._compat_cached_profile_variant = profile_variant
+        if ua_variant == "emulator":
+            self._compat_cached_ua_variant = "emulator"
+            # A previously validated emulator identity is a portal-root learning
+            # result, not merely metadata. Reapply it immediately on a new
+            # client/session so the next handshake does not repeat a known-bad
+            # primary UA before reaching the proven compatibility path.
+            self._compat_use_emulator_ua = True
+
+    def _persist_compat_state(self, endpoint=None, method=None, profile_variant=None, ua_variant=None):
+        state = dict(self._compat_state or {})
+        changed = False
+        if endpoint is not None:
+            value = str(endpoint or "").strip().rstrip("/")
+            if value and same_origin(value, self.entry_url) and urllib.parse.urlsplit(value).path.lower().endswith(".php"):
+                if state.get("endpoint") != value:
+                    state["endpoint"] = value; changed = True
+                self._compat_cached_endpoint = value
+            elif not value and state.get("endpoint"):
+                state.pop("endpoint", None); changed = True
+                self._compat_cached_endpoint = ""
+        if method is not None:
+            value = str(method or "").strip().upper()
+            if value in ("GET", "POST"):
+                if state.get("method") != value:
+                    state["method"] = value; changed = True
+                self._compat_cached_method = value
+            elif state.get("method"):
+                state.pop("method", None); changed = True
+                self._compat_cached_method = ""
+        if profile_variant is not None:
+            value = str(profile_variant or "").strip().lower()
+            allowed = ("random_upper", "random_lower", "random_upper_emulator", "random_lower_emulator")
+            if value in allowed:
+                if state.get("profile_variant") != value:
+                    state["profile_variant"] = value; changed = True
+                self._compat_cached_profile_variant = value
+            elif state.get("profile_variant"):
+                state.pop("profile_variant", None); changed = True
+                self._compat_cached_profile_variant = ""
+        if ua_variant is not None:
+            value = str(ua_variant or "").strip().lower()
+            if value == "emulator":
+                if state.get("ua_variant") != value:
+                    state["ua_variant"] = value; changed = True
+                self._compat_cached_ua_variant = value
+            elif state.get("ua_variant"):
+                state.pop("ua_variant", None); changed = True
+                self._compat_cached_ua_variant = ""
+        if not changed:
+            return
+        try:
+            DB.state_put(self._compat_state_key(), state)
+            self._compat_state = state
+        except Exception as exc:
+            LOG.debug("Portal compatibility state could not be persisted: %s", exc)
+
+    def _invalidate_compat_endpoint(self, endpoint=""):
+        value = str(endpoint or self._compat_cached_endpoint or "").rstrip("/")
+        if value:
+            self._compat_endpoint_methods.pop(value, None)
+        if not value or value == str(self._compat_cached_endpoint or "").rstrip("/"):
+            self._persist_compat_state(endpoint="", method="")
+
     @classmethod
     def clear_persisted_tls_pins(cls, portal, mac):
         """Forget compatible-TLS TOFU pins after an explicit security-mode change."""
@@ -417,6 +536,52 @@ class StalkerClient:
         except Exception as exc:
             LOG.debug("Could not reset compatible TLS certificate approval: %s", exc)
             return False
+
+    def _content_cache_state_key(self):
+        raw = (self._state_host.rstrip("/").lower() + "|" + self.mac.upper()).encode("utf-8", "ignore")
+        return "content_generation:" + hashlib.sha256(raw).hexdigest()
+
+    def _load_content_cache_generation(self):
+        try:
+            state=DB.state_get(self._content_cache_state_key())
+            return max(0,int((state or {}).get("generation") or 0))
+        except Exception:
+            return 0
+
+    def _bump_content_cache_generation(self):
+        generation=max(0,int(getattr(self,"_content_cache_generation",0) or 0))+1
+        self._content_cache_generation=generation
+        try:
+            DB.state_put(self._content_cache_state_key(),{
+                "portal":self._state_entry_url,
+                "mac":self.mac,
+                "generation":generation,
+            })
+        except Exception as exc:
+            LOG.debug("Could not persist content refresh generation: %s",exc)
+        return generation
+
+    def refresh_content(self,cancel_event=None):
+        """Invalidate only this Portal's catalogue cache and prime fresh categories.
+
+        Artwork/TMDB/title-logo HDD caches are deliberately untouched. Old hashed
+        API cache rows may remain physically in SQLite, but a per-source generation
+        makes them unreachable after this explicit refresh, including after reboot.
+        """
+        self._bump_content_cache_generation()
+        with self._series_hierarchy_lock:
+            self._series_hierarchy_memory={}
+            self._series_hierarchy_memory_at={}
+        self.reset_failure_backoff()
+        if not self.token:
+            self.authorize(cancel_event=cancel_event)
+        counts={}
+        for media_type in ("itv","vod","series"):
+            if cancel_event is not None and getattr(cancel_event,"is_set",lambda:False)():
+                break
+            rows=self.genres(media_type,cancel_event=cancel_event)
+            counts[media_type]=len(rows or [])
+        return {"ok":True,"source":"Portal","categories":counts,"generation":self._content_cache_generation}
 
     # ------------------------------------------------------------------
     # URL / identity helpers
@@ -469,24 +634,34 @@ class StalkerClient:
         candidates = []
         if self.endpoint:
             candidates.append(self.endpoint)
+        if self._compat_cached_endpoint:
+            candidates.append(self._compat_cached_endpoint)
+        for item in self._compat_discovered_candidates:
+            if item:
+                candidates.append(item)
         if entry_path.lower().endswith((".php", "/load.php")):
             candidates.append(self.entry_url)
 
         if self.path_prefix == "/stalker_portal/c/":
             candidates.extend([
                 self.host + "/stalker_portal/server/load.php",
+                self.host + "/stalker_portal/server/portal.php",
                 self.host + "/stalker_portal/portal.php",
+                self.host + "/stalker_portal/portal1.php",
                 self.host + "/portal.php",
+                self.host + "/portal1.php",
                 self.host + "/server/load.php",
             ])
         else:
-            # /c/ portals normally resolve to /portal.php. Prefer that exact
-            # order because some servers return HTML from /server/load.php.
+            # /c/ portals normally resolve to /portal.php. Keep the existing
+            # order and add portal1.php only as a late compatibility candidate.
             candidates.extend([
                 self.host + "/portal.php",
                 self.host + "/server/load.php",
+                self.host + "/portal1.php",
                 self.host + "/stalker_portal/server/load.php",
                 self.host + "/stalker_portal/portal.php",
+                self.host + "/stalker_portal/portal1.php",
             ])
 
         # Custom subdirectory portals occasionally place the loader next to /c/.
@@ -499,15 +674,100 @@ class StalkerClient:
         if base_path and base_path != "/stalker_portal":
             candidates.extend([
                 self.host + base_path + "/portal.php",
+                self.host + base_path + "/portal1.php",
                 self.host + base_path + "/server/load.php",
             ])
 
         result = []
         for item in candidates:
-            item = re.sub(r"(?<!:)//+", "/", item)
+            item = re.sub(r"(?<!:)//+", "/", str(item or ""))
+            if not item or not same_origin(item, self.entry_url):
+                continue
+            try:
+                if not urllib.parse.urlsplit(item).path.lower().endswith(".php"):
+                    continue
+            except Exception:
+                continue
             if item not in result:
                 result.append(item)
         return result
+
+    def _fetch_frontend_text(self, url, cancel_event=None, timeout=1.6):
+        """Fetch one same-origin frontend JS file with strict size/time bounds."""
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise PortalCancelledError("Request cancelled")
+        if not same_origin(url, self.entry_url):
+            return ""
+        client = self
+
+        class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                target = urllib.parse.urljoin(req.full_url, newurl)
+                if not same_origin(target, client.entry_url):
+                    return None
+                return urllib.request.HTTPRedirectHandler.redirect_request(
+                    self, req, fp, code, msg, headers, target
+                )
+
+        context = self._tls_context(verified=True)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context), _SameOriginRedirect()
+        )
+        headers = {
+            "User-Agent": self._profile_spec()["user_agent"],
+            "Accept": "application/javascript,text/javascript,*/*;q=0.2",
+            "Referer": self.referer,
+            "Connection": "close",
+        }
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with opener.open(request, timeout=max(0.8, min(float(timeout or 1.6), 2.0))) as response:
+                final_url = str(getattr(response, "geturl", lambda: url)() or url)
+                if not same_origin(final_url, self.entry_url):
+                    return ""
+                payload = response.read(MAX_FRONTEND_BYTES + 1)
+                if len(payload) > MAX_FRONTEND_BYTES:
+                    return ""
+                content_type = str(response.headers.get("Content-Type", "") or "").lower()
+                text = payload.decode("utf-8-sig", "replace")
+                if ("javascript" not in content_type and "text/" not in content_type
+                        and ".php" not in text.lower()):
+                    return ""
+                return text
+        except PortalCancelledError:
+            raise
+        except Exception:
+            return ""
+
+    def _discover_portal_endpoints(self, cancel_event=None):
+        """Run one bounded frontend discovery pass for this client session."""
+        if self._compat_discovery_attempted:
+            return list(self._compat_discovered_candidates)
+        self._compat_discovery_attempted = True
+        LOG.info("Portal bootstrap discovery started")
+        found = []
+        deadline = time.monotonic() + 4.2
+        for js_url in frontend_candidates(self.entry_url):
+            if time.monotonic() >= deadline:
+                break
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                raise PortalCancelledError("Request cancelled")
+            remaining = max(0.8, min(1.6, deadline - time.monotonic()))
+            text = self._fetch_frontend_text(js_url, cancel_event=cancel_event, timeout=remaining)
+            if not text:
+                continue
+            for endpoint in extract_declared_endpoints(text, js_url, self.entry_url):
+                if endpoint not in found:
+                    found.append(endpoint)
+                    LOG.info("Dynamic endpoint found: %s", endpoint_log_label(endpoint))
+                if len(found) >= 6:
+                    break
+            # One real frontend file is authoritative enough for this bounded
+            # pass. Do not probe extra JS files after it declared API paths.
+            if found:
+                break
+        self._compat_discovered_candidates = found
+        return list(found)
 
     # ------------------------------------------------------------------
     # HTTP / session
@@ -531,7 +791,8 @@ class StalkerClient:
 
     def _headers(self):
         parsed = urllib.parse.urlsplit(self.host)
-        encoded_mac = urllib.parse.quote(self.mac, safe="")
+        wire_mac = str(self._compat_mac_override or self.mac)
+        encoded_mac = urllib.parse.quote(wire_mac, safe="")
         encoded_tz = urllib.parse.quote(self._timezone, safe="")
         with self._server_cookie_lock:
             cookies = dict(self._server_cookies)
@@ -544,8 +805,8 @@ class StalkerClient:
             "Pragma": "no-cache",
             "Accept": "*/*",
             "Host": parsed.netloc,
-            "User-Agent": spec["user_agent"],
-            "X-User-Agent": spec["x_user_agent"],
+            "User-Agent": EMULATOR_USER_AGENT if self._compat_use_emulator_ua else spec["user_agent"],
+            "X-User-Agent": "Model: MAG250; Link: WiFi" if self._compat_use_emulator_ua else spec["x_user_agent"],
             "Connection": "keep-alive",
             "Accept-Encoding": "gzip",
             "Referer": self.referer,
@@ -600,6 +861,11 @@ class StalkerClient:
         self._circuit_state[key] = {"failures": 0, "opened_at": 0}
 
     def _record_failure(self):
+        # The shared breaker protects catalogue/artwork/background traffic.
+        # Explicit user playback has its own bounded retry/auth policy and must
+        # neither inherit nor poison that background failure budget.
+        if bool(getattr(self._priority_local, "playback", False)):
+            return
         key = self._portal_key()
         state = dict(self._circuit_state.get(key, {"failures": 0, "opened_at": 0}))
         state["failures"] = int(state.get("failures", 0)) + 1
@@ -617,6 +883,13 @@ class StalkerClient:
         self._circuit_state[self._portal_key()] = {"failures": 0, "opened_at": 0}
 
     def _check_circuit(self):
+        # Explicit user playback is a priority lane.  Background artwork or
+        # metadata failures may protect themselves with the shared breaker, but
+        # they must never prevent create_link/authorize from reaching a healthy
+        # portal.  The flag is thread-local, so normal/background callers keep
+        # the existing protection unchanged.
+        if bool(getattr(self._priority_local, "playback", False)):
+            return
         state = self._circuit_state.get(self._portal_key()) or {}
         opened_at = float(state.get("opened_at", 0) or 0)
         if not opened_at:
@@ -631,7 +904,9 @@ class StalkerClient:
         self._circuit_state[self._portal_key()] = {"failures": 0, "opened_at": 0}
 
     def _cache_key(self, params):
-        return CACHE.key(self.host, self.mac, params)
+        scoped=dict(params or {})
+        scoped["_us_content_generation"]=str(max(0,int(getattr(self,"_content_cache_generation",0) or 0)))
+        return CACHE.key(self.host, self.mac, scoped)
 
     def _cache_get(self, params):
         return CACHE.get(self._cache_key(params))
@@ -797,10 +1072,88 @@ class StalkerClient:
             self._drop_current_transport(close=True)
             raise
 
-    def _request_endpoint(self, endpoint, params, extra_headers=None, cancel_event=None):
+    def _request_endpoint_post(self, endpoint, params, extra_headers=None, cancel_event=None):
+        """Single bounded form-POST compatibility attempt for a proven API path."""
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise PortalCancelledError("Request cancelled")
+        if not same_origin(endpoint, self.entry_url):
+            raise PortalError("Portal POST fallback changed origin")
+        parsed = urllib.parse.urlsplit(endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise PortalError("Unsupported portal transport")
+        body = urllib.parse.urlencode(params).encode("utf-8")
+        headers = self._headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        headers["Content-Length"] = str(len(body))
+        timeout = self._adaptive_timeout()
+        conn = None
+        try:
+            started = time.monotonic()
+            if parsed.scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    parsed.hostname, parsed.port or 443, timeout=timeout,
+                    context=self._tls_context(verified=True),
+                )
+            else:
+                conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
+            target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            conn.request("POST", target, body=body, headers=headers)
+            response = conn.getresponse()
+            self._remember_response_cookies(response.headers)
+            status = int(response.status or 0)
+            if status in (301, 302, 303, 307, 308):
+                raise PortalError("Portal POST fallback returned a redirect")
+            if status >= 400:
+                raise urllib.error.HTTPError(endpoint, status, response.reason, response.headers, None)
+            payload = response.read(self.MAX_RESPONSE_BYTES + 1)
+            if len(payload) > self.MAX_RESPONSE_BYTES:
+                raise PortalDataError("Portal response is too large")
+            if str(response.headers.get("Content-Encoding", "")).lower() == "gzip":
+                payload = _bounded_gzip_decompress(payload, self.MAX_RESPONSE_BYTES)
+            raw = payload.decode("utf-8-sig", "replace").strip()
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            PERF.record("http.request_ms", elapsed_ms); PERF.increment("http.requests")
+            self._record_success(elapsed_ms)
+            if not raw:
+                raise PortalDataError("Portal returned empty data")
+            try:
+                return json.loads(raw)
+            except (ValueError, TypeError):
+                snippet = re.sub(r"\s+", " ", raw)[:110]
+                raise PortalDataError("Portal returned non-JSON data%s" % ((": " + snippet) if snippet else ""))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise PortalAuthError("HTTP %s authorization failed" % exc.code)
+            if exc.code == 429:
+                raise PortalThrottleError("HTTP 429 rate limit")
+            raise PortalError("HTTP %s" % exc.code)
+        finally:
+            try:
+                if conn is not None: conn.close()
+            except Exception:
+                pass
+
+    def _request_endpoint(self, endpoint, params, extra_headers=None, cancel_event=None, max_attempts=None):
         self._check_circuit()
+        preferred_method = str(self._compat_endpoint_methods.get(endpoint) or "").upper()
+        if preferred_method == "POST":
+            try:
+                data = self._request_endpoint_post(endpoint, params, extra_headers=extra_headers, cancel_event=cancel_event)
+                return data
+            except PortalCancelledError:
+                raise
+            except PortalError:
+                # A persisted method hint is an optimization, never a trap.
+                self._compat_endpoint_methods.pop(endpoint, None)
+                if endpoint == self._compat_cached_endpoint:
+                    self._persist_compat_state(method="")
         url = endpoint + "?" + urllib.parse.urlencode(params)
         attempts = len(self.RETRY_DELAYS) + 1
+        if max_attempts is not None:
+            try: attempts = max(1, min(attempts, int(max_attempts)))
+            except (TypeError, ValueError): pass
         last_error = None
         attempt = 0
         while attempt < attempts:
@@ -886,6 +1239,24 @@ class StalkerClient:
             if cancel_event is None:
                 time.sleep(delay)
             attempt += 1
+        # Some middleware exposes the same API only to form POST.  Never pay
+        # this compatibility cost on a healthy GET portal: try it only after a
+        # specific GET failure that can plausibly be method-sensitive.
+        message = str(last_error or "").lower()
+        post_eligible = isinstance(last_error, (PortalDataError, PortalAuthError)) or "http 405" in message
+        if post_eligible:
+            try:
+                data = self._request_endpoint_post(endpoint, params, extra_headers=extra_headers, cancel_event=cancel_event)
+                self._compat_endpoint_methods[endpoint] = "POST"
+                # A method fallback is only an in-session hint at this point.
+                # Persist the endpoint only after the caller accepts the actual
+                # operation result (for example a handshake token).
+                LOG.info("Portal API method fallback accepted: POST %s", endpoint_log_label(endpoint))
+                return data
+            except PortalCancelledError:
+                raise
+            except PortalError as exc:
+                last_error = exc
         raise last_error or PortalError("Portal request failed")
 
     def _get_once(self, params, use_cache=False, extra_headers=None, cancel_event=None):
@@ -895,12 +1266,46 @@ class StalkerClient:
                 return cached
         errors = []
         security_consent_error = None
-        for endpoint in self._candidate_endpoints():
+        action = str((params or {}).get("action") or "").strip().lower()
+        playback_link = bool(getattr(self._priority_local, "playback", False) and action == "create_link")
+        endpoints = list(self._candidate_endpoints())
+        preferred_playback_endpoint = ""
+        if playback_link:
+            # Freeze playback to the endpoint that was proven when Play began.
+            # Background catalogue/artwork requests may discover or mutate
+            # self.endpoint concurrently; they must not make a fresh-socket
+            # playback retry jump to another API path mid-resolution.
+            pinned = str(getattr(self._priority_local, "playback_endpoint", "") or "").strip()
+            # create_link should normally use the endpoint that already
+            # authenticated and served this portal.  Do not roam through every
+            # compatibility candidate after a transient timeout/5xx: that turns
+            # one user Play into a long chain of unrelated endpoint probes.
+            # Structural endpoint failures (404/405/non-JSON/empty) are still
+            # allowed to fall through to the compatibility candidates below.
+            for candidate in (pinned, self.endpoint, self._compat_cached_endpoint):
+                candidate = str(candidate or "").strip()
+                if candidate and candidate in endpoints:
+                    preferred_playback_endpoint = candidate
+                    break
+            if preferred_playback_endpoint:
+                endpoints = [preferred_playback_endpoint] + [
+                    endpoint for endpoint in endpoints if endpoint != preferred_playback_endpoint
+                ]
+        for endpoint in endpoints:
             try:
-                data = self._request_endpoint(endpoint, params, extra_headers=extra_headers, cancel_event=cancel_event)
+                data = self._request_endpoint(
+                    endpoint, params, extra_headers=extra_headers, cancel_event=cancel_event,
+                    max_attempts=1 if playback_link else None,
+                )
                 self.endpoint = endpoint
                 self.portal = endpoint
+                if playback_link:
+                    self._priority_local.playback_endpoint = endpoint
                 self._persist_transport_state()
+                if (endpoint == self._compat_cached_endpoint or endpoint in self._compat_discovered_candidates
+                        or self._compat_endpoint_methods.get(endpoint) == "POST"):
+                    method = self._compat_endpoint_methods.get(endpoint) or "GET"
+                    self._persist_compat_state(endpoint=endpoint, method=method)
                 if use_cache:
                     self._cache_put(params, data)
                 return data
@@ -917,7 +1322,24 @@ class StalkerClient:
                 # network failure.  Propagate it unchanged.
                 if "temporarily paused after repeated failures" in str(exc).lower():
                     raise
+                message = str(exc).lower()
+                endpoint_invalid = any(
+                    marker in message for marker in ("http 404", "http 405", "non-json", "empty data")
+                )
+                if str(params.get("action") or "").lower() == "handshake" and "http 403" in message:
+                    endpoint_invalid = True
+                if endpoint == self._compat_cached_endpoint and endpoint_invalid:
+                    self._invalidate_compat_endpoint(endpoint)
+                    LOG.info("Cached portal endpoint invalidated: %s", endpoint_log_label(endpoint))
                 errors.append("%s: %s" % (endpoint, exc))
+                if playback_link and preferred_playback_endpoint and endpoint == preferred_playback_endpoint and not endpoint_invalid:
+                    # The known-good API path is still structurally valid.
+                    # Surface this transient/auth/throttle failure immediately so
+                    # the bounded playback layer can decide on exactly one fresh
+                    # socket replay or one auth refresh.  Never spend several
+                    # seconds probing alternate portal.php/load.php variants for
+                    # a failure that is unrelated to endpoint discovery.
+                    raise
 
         if self.allow_http_fallback and not self.used_http_fallback and self.host.startswith("https://"):
             self.host = "http://" + self.host[8:]
@@ -958,16 +1380,142 @@ class StalkerClient:
             raise
 
     def _reset_auth(self):
-        self.token = None
-        self.token_random = ""
-        self.play_token = ""
-        self.profile_initialized = False
-        self.account_valid = False
+        with self._auth_lock:
+            self.token = None
+            self.token_random = ""
+            self.play_token = ""
+            self.profile_initialized = False
+            self.account_valid = False
+
+    @staticmethod
+    def _is_auth_playback_error(exc):
+        if isinstance(exc, PortalAuthError):
+            return True
+        message = str(exc or "").lower()
+        return any(marker in message for marker in (
+            "http 401", "http 403", "authorization", "not valid token",
+            "token expired", "invalid token", "expired token",
+        ))
+
+    @staticmethod
+    def _is_transient_playback_transport_error(exc):
+        """Return True only for one-shot transport/response faults worth replaying.
+
+        Playback gets one fresh-socket replay for failures that are commonly
+        caused by a stale keep-alive or a truncated middleware response.  Auth,
+        throttle, security-consent and semantic link failures deliberately stay
+        outside this lane.
+        """
+        if isinstance(exc, (PortalAuthError, PortalThrottleError, PortalSecurityConsentError, PortalCancelledError, PortalLinkError)):
+            return False
+        if isinstance(exc, PortalDataError):
+            return True
+        message = str(exc or "").lower()
+        return any(marker in message for marker in (
+            "connection failed", "connection timed out", "timed out",
+            "connection was refused", "host could not be resolved",
+            "returned empty data", "non-json", "remote end closed",
+            "connection reset", "broken pipe",
+            "http 408", "http 500", "http 502", "http 503", "http 504",
+        ))
+
+    def _playback_request_once_more_on_fresh_transport(self, request_callable):
+        """Run one playback API call with a bounded fresh-socket replay.
+
+        Normal portal traffic keeps persistent keep-alive for performance.  An
+        explicit Play action is rare and latency-sensitive in a different way:
+        if a pooled worker inherited a stale socket, retry exactly once after
+        dropping only that thread's transport.  Authorization state is preserved.
+        """
+        try:
+            return request_callable()
+        except PortalCancelledError:
+            raise
+        except PortalError as exc:
+            if not self._is_transient_playback_transport_error(exc):
+                raise
+            try:
+                self._drop_current_transport(close=True)
+            except Exception:
+                pass
+            LOG.info("Playback transport replay on fresh socket after %s", exc.__class__.__name__)
+            return request_callable()
 
     # ------------------------------------------------------------------
     # MAG authorization
     # ------------------------------------------------------------------
+    def _compat_handshake_candidates(self, limit=6):
+        """Return a bounded, root-diverse endpoint set for identity/UA fallback."""
+        try:
+            limit = max(1, min(int(limit or 6), 6))
+        except (TypeError, ValueError):
+            limit = 6
+        ordered = []
+        for endpoint in ([self._compat_cached_endpoint] + list(self._compat_discovered_candidates)
+                         + list(self._candidate_endpoints())):
+            endpoint = str(endpoint or "").strip().rstrip("/")
+            if endpoint and endpoint not in ordered:
+                ordered.append(endpoint)
+
+        selected = []
+        # Proven/discovered hints go first because they were learned from this
+        # exact portal, but never exceed the global bound.
+        for endpoint in ([self._compat_cached_endpoint] + list(self._compat_discovered_candidates)):
+            endpoint = str(endpoint or "").strip().rstrip("/")
+            if endpoint and endpoint in ordered and endpoint not in selected:
+                selected.append(endpoint)
+                if len(selected) >= limit:
+                    return selected
+
+        def endpoint_shape(endpoint):
+            parsed = urllib.parse.urlsplit(endpoint)
+            path = re.sub(r"/+", "/", parsed.path or "/")
+            low = path.lower()
+            if low.endswith("/server/load.php"):
+                root_path = path[:-len("/server/load.php")] or ""; kind = 0
+            elif low.endswith("/server/portal.php"):
+                root_path = path[:-len("/server/portal.php")] or ""; kind = 1
+            elif low.endswith("/portal.php"):
+                root_path = path[:-len("/portal.php")] or ""; kind = 1
+            elif low.endswith("/portal1.php"):
+                root_path = path[:-len("/portal1.php")] or ""; kind = 2
+            else:
+                root_path = path.rsplit("/", 1)[0] if "/" in path else ""; kind = 3
+            root = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, root_path, "", "")).rstrip("/")
+            return root.lower(), kind
+
+        roots = [str(root or "").rstrip("/").lower() for root in portal_roots(self.entry_url)]
+        ranked = []
+        for index, endpoint in enumerate(ordered):
+            root, kind = endpoint_shape(endpoint)
+            try:
+                root_rank = roots.index(root)
+            except ValueError:
+                root_rank = len(roots)
+            ranked.append((kind, root_rank, index, endpoint))
+        ranked.sort()
+        # Round-robin by endpoint family: loader from each root first, then
+        # portal.php, then portal1.php.  This avoids spending the whole fallback
+        # budget on several aliases below only one middleware root.
+        for kind in range(4):
+            for root_rank in range(len(roots) + 1):
+                for row_kind, row_root, _index, endpoint in ranked:
+                    if row_kind != kind or row_root != root_rank or endpoint in selected:
+                        continue
+                    selected.append(endpoint)
+                    break
+                if len(selected) >= limit:
+                    return selected
+        return selected
+
     def authorize(self, cancel_event=None):
+        # Serialize token/profile mutation.  This prevents an artwork/metadata
+        # worker from clearing/replacing the shared auth state while Play is
+        # resolving a stream URL.
+        with self._auth_lock:
+            return self._authorize_impl(cancel_event=cancel_event)
+
+    def _authorize_impl(self, cancel_event=None):
         self._reset_auth()
         variants = [
             {"type": "stb", "action": "handshake", "token": "", "JsHttpRequest": "1-xml"},
@@ -996,7 +1544,94 @@ class StalkerClient:
 
         token = js.get("token") if isinstance(js, dict) else None
         if not token:
+            LOG.info("Primary handshake failed; checking bounded portal bootstrap discovery")
+            try:
+                discovered = self._discover_portal_endpoints(cancel_event=cancel_event)
+            except PortalCancelledError:
+                raise
+            except Exception as exc:
+                LOG.debug("Portal bootstrap discovery failed safely: %s", exc)
+                discovered = []
+            for endpoint in discovered:
+                if token:
+                    break
+                LOG.info("Trying discovered portal endpoint: %s", endpoint_log_label(endpoint))
+                for params in variants:
+                    try:
+                        js = self._unwrap(self._request_endpoint(
+                            endpoint, params, cancel_event=cancel_event, max_attempts=1
+                        ))
+                        token = js.get("token") if isinstance(js, dict) else None
+                        if token:
+                            break
+                        msg = str(js.get("msg") or "") if isinstance(js, dict) else ""
+                        if "missing" in msg.lower():
+                            fake_token = "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(32))
+                            prehash = hashlib.sha1(fake_token.encode("utf-8")).hexdigest()
+                            fake_headers = {"Authorization": "Bearer " + fake_token}
+                            js = self._unwrap(self._request_endpoint(
+                                endpoint,
+                                {"type": "stb", "action": "handshake", "JsHttpRequest": "1-xml", "mac": self.mac, "prehash": prehash},
+                                extra_headers=fake_headers, cancel_event=cancel_event, max_attempts=1,
+                            ))
+                            token = js.get("token") if isinstance(js, dict) else None
+                            if token:
+                                break
+                    except PortalCancelledError:
+                        raise
+                    except PortalError as exc:
+                        last_error = exc
+                if token:
+                    self.endpoint = endpoint
+                    self.portal = endpoint
+                    method = self._compat_endpoint_methods.get(endpoint) or "GET"
+                    self._persist_compat_state(endpoint=endpoint, method=method)
+                    self._persist_transport_state()
+                    LOG.info("Discovered portal endpoint validated: %s", endpoint_log_label(endpoint))
+                    break
+        if not token:
+            LOG.info("Trying emulator-style User-Agent fallback for handshake")
+            ua_headers = {
+                "User-Agent": EMULATOR_USER_AGENT,
+                "X-User-Agent": "Model: MAG250; Link: WiFi",
+            }
+            ua_candidates = self._compat_handshake_candidates(limit=6)
+            for endpoint in ua_candidates:
+                if token:
+                    break
+                for params in variants:
+                    try:
+                        js = self._unwrap(self._request_endpoint(
+                            endpoint, params, extra_headers=ua_headers,
+                            cancel_event=cancel_event, max_attempts=1,
+                        ))
+                        token = js.get("token") if isinstance(js, dict) else None
+                        if token:
+                            self.endpoint = endpoint
+                            self.portal = endpoint
+                            self._compat_use_emulator_ua = True
+                            method = self._compat_endpoint_methods.get(endpoint) or "GET"
+                            self._persist_compat_state(endpoint=endpoint, method=method, ua_variant="emulator")
+                            self._persist_transport_state()
+                            break
+                    except PortalCancelledError:
+                        raise
+                    except PortalError as exc:
+                        last_error = exc
+
+        if not token:
             raise last_error or PortalError("Handshake did not return a token")
+        # A handshake token is the authority for calling an API endpoint
+        # working.  Remember that endpoint by portal root (not MAC) so another
+        # profile on the same middleware can skip redundant endpoint probing.
+        working_endpoint = str(self.endpoint or "").strip().rstrip("/")
+        if working_endpoint:
+            try:
+                if same_origin(working_endpoint, self.entry_url) and urllib.parse.urlsplit(working_endpoint).path.lower().endswith(".php"):
+                    method = self._compat_endpoint_methods.get(working_endpoint) or "GET"
+                    self._persist_compat_state(endpoint=working_endpoint, method=method)
+            except Exception:
+                pass
         self.token = str(token)
         self.token_random = str(js.get("random") or "")
         self._initialize_profile(cancel_event=cancel_event)
@@ -1026,7 +1661,7 @@ class StalkerClient:
             "uid": device_id2 if in_stalker_path else "",
             "random": self.token_random if in_stalker_path else "",
         }
-        metrics = urllib.parse.quote(json.dumps(metrics_data, separators=(",", ":")), safe="")
+        metrics = json.dumps(metrics_data, separators=(",", ":"))
         return OrderedDict([
             ("type", "stb"), ("action", "get_profile"), ("JsHttpRequest", "1-xml"),
             ("hd", "1"), ("ver", spec["ver"]),
@@ -1045,10 +1680,123 @@ class StalkerClient:
             ("sn", sn), ("device_id", ""), ("timestamp", str(int(time.time()))),
         ])
 
+    @staticmethod
+    def _profile_problem_text(js):
+        try:
+            return json.dumps(js, ensure_ascii=False, sort_keys=True).lower()
+        except Exception:
+            return str(js or "").lower()
+
+    def _compat_profile_params(self, mac_value):
+        """Dedicated random-aware MAG250 fallback, isolated from normal Ultra profiles.
+
+        This branch is intentionally minimal and is reached only after the
+        current Ultra identities fail.  Keep its middleware identity stable:
+        changing DEVICE_PROFILES must not silently mutate this compatibility
+        request.
+        """
+        mac_value = str(mac_value or self.mac)
+        identity = compatible_identity(mac_value, self.token_random)
+        sn = identity["sn"]
+        device_id = identity["device_id"]
+        device_id2 = identity["device_id2"]
+        signature = identity["signature"]
+        metrics = json.dumps({
+            "mac": mac_value,
+            "sn": sn,
+            "type": "STB",
+            "model": "MAG250",
+            "random": str(self.token_random or ""),
+        }, separators=(",", ":"))
+        compat_ver = (
+            "ImageDescription: 0.2.18-r23-250; PORTAL version: 5.3.0; "
+            "API Version: JS API version: 343; STB API version: 146; "
+            "Player Engine version: 0x58c"
+        )
+        return OrderedDict([
+            ("type", "stb"), ("action", "get_profile"), ("JsHttpRequest", "1-xml"),
+            ("ver", compat_ver),
+            ("sn", sn), ("stb_type", "MAG250"), ("client_type", "STB"),
+            ("device_id", device_id), ("device_id2", device_id2), ("signature", signature),
+            ("auth_second_step", "1"),
+            ("hw_version", "2.17-IB-00"), ("hw_version_2", "62"),
+            ("metrics", metrics),
+        ])
+
+    def _compat_profile_headers(self, mac_value, emulator=False):
+        base = self._headers()
+        parts = []
+        replaced = False
+        encoded_mac = urllib.parse.quote(str(mac_value or self.mac), safe="")
+        for part in str(base.get("Cookie") or "").split(";"):
+            piece = part.strip()
+            if piece.lower().startswith("mac="):
+                parts.append("mac=" + encoded_mac); replaced = True
+            elif piece:
+                parts.append(piece)
+        if not replaced:
+            parts.insert(0, "mac=" + encoded_mac)
+        headers = {"Cookie": "; ".join(parts)}
+        if emulator:
+            headers["User-Agent"] = EMULATOR_USER_AGENT
+            headers["X-User-Agent"] = "Model: MAG250; Link: WiFi"
+        return headers
+
+    def _try_compat_profile(self, cancel_event=None):
+        cached = str(self._compat_cached_profile_variant or "")
+        variants = []
+        if cached:
+            variants.append(cached)
+        for name in ("random_upper", "random_lower", "random_upper_emulator", "random_lower_emulator"):
+            if name not in variants:
+                variants.append(name)
+        last_error = None
+        for variant in variants:
+            lower = "_lower" in variant
+            emulator = variant.endswith("_emulator")
+            mac_value = self.mac.lower() if lower else self.mac.upper()
+            LOG.info("Trying random-aware MAG profile%s%s",
+                     " with MAC-case fallback" if lower else "",
+                     " and emulator UA" if emulator else "")
+            try:
+                js = self._unwrap(self._get(
+                    self._compat_profile_params(mac_value), retry_auth=False,
+                    extra_headers=self._compat_profile_headers(mac_value, emulator=emulator),
+                    cancel_event=cancel_event,
+                ))
+                if not isinstance(js, dict):
+                    continue
+                self._remember_live_link_policy(js)
+                text = self._profile_problem_text(js)
+                if any(marker in text for marker in ("device_id mismatch", "old firmware", "not valid token", "authorization failed")):
+                    continue
+                msg = str(js.get("msg") or "").lower()
+                if msg and "error" in msg and not js.get("play_token"):
+                    continue
+                self.play_token = str(js.get("play_token") or "")
+                self.profile_initialized = True
+                self.resolved_device_profile = "mag250"
+                self._compat_mac_override = mac_value if lower else ""
+                self._compat_use_emulator_ua = bool(self._compat_use_emulator_ua or emulator)
+                self._persist_compat_state(
+                    profile_variant=variant,
+                    ua_variant="emulator" if self._compat_use_emulator_ua else "",
+                )
+                self._persist_transport_state()
+                return True
+            except PortalCancelledError:
+                raise
+            except PortalError as exc:
+                last_error = exc
+        if last_error:
+            LOG.debug("Compatibility MAG profile fallback exhausted: %s", last_error)
+        return False
+
     def _initialize_profile(self, cancel_event=None):
         if self.profile_initialized or not self.token:
             return
         last_error = None
+        identity_problem = False
         if self.device_profile == "auto":
             preferred = "mag254" if (self.path_prefix == "/stalker_portal/c/" or (self.endpoint and "/stalker_portal/" in self.endpoint)) else "mag250"
             profile_names = [preferred] + [x for x in ("mag250", "mag254", "mag256") if x != preferred]
@@ -1061,6 +1809,11 @@ class StalkerClient:
                 self.resolved_device_profile = name or self.resolved_device_profile
                 js = self._unwrap(self._get(params, retry_auth=False, cancel_event=cancel_event))
                 if isinstance(js, dict):
+                    self._remember_live_link_policy(js)
+                    text = self._profile_problem_text(js)
+                    if any(marker in text for marker in ("device_id mismatch", "old firmware")):
+                        identity_problem = True
+                        continue
                     msg = str(js.get("msg") or "")
                     self.play_token = str(js.get("play_token") or "")
                     if msg and not self.play_token and "error" in msg.lower():
@@ -1068,8 +1821,17 @@ class StalkerClient:
                     self.profile_initialized = True
                     self._persist_transport_state()
                     return
+            except PortalCancelledError:
+                raise
             except PortalError as exc:
                 last_error = exc
+
+        # Primary Ultra identities stay first. Only a portal that rejected all
+        # of them reaches this bounded compatibility branch.
+        if self.token_random or identity_problem or last_error is not None:
+            if self._try_compat_profile(cancel_event=cancel_event):
+                return
+
         # Some older portals are token-only. Keep compatibility but record it.
         self.profile_initialized = True
         if last_error:
@@ -1100,29 +1862,117 @@ class StalkerClient:
         return js if isinstance(js, dict) else {"raw": js}
 
     def genres(self, media_type="itv", cancel_event=None):
-        """Return categories exactly in the order supplied by the portal.
+        """Return provider categories without locally rewriting their names.
 
-        Some portals reject requests without ``sortby``.  In that uncommon case
-        we retry with the old compatibility value, but we never sort the result
-        locally.
+        Most Stalker portals expose Live folders through ``get_genres``.  A few
+        newer variants return only short routing labels there (for example many
+        different rows all called ``AR``) while ``get_categories`` contains the
+        real folder names.  Only when the first response is clearly collapsed do
+        we make the alternate request, so normal/older portals keep the original
+        one-request fast path.
         """
         if not self.token:
             self.authorize(cancel_event=cancel_event)
         media_type = str(media_type or "itv").lower()
-        actions = ("get_genres",) if media_type == "itv" else ("get_categories", "get_genres")
         errors = []
-        for action in actions:
+
+        def request_category(params):
+            # Home already resolved/authorized a working MAG endpoint. Category
+            # navigation should use that exact endpoint instead of scanning every
+            # historical loader candidate with three retries each (which can turn
+            # one dead request into several minutes of apparent UI freeze).
+            cached = self._cache_get(params)
+            if cached is not None:
+                return cached
+            endpoint = str(self.endpoint or "").strip()
+            if not endpoint:
+                return self._get(params, use_cache=True, cancel_event=cancel_event)
+            try:
+                data = self._request_endpoint(endpoint, params, cancel_event=cancel_event, max_attempts=1)
+            except PortalError as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in ("http 401", "http 403", "authorization", "token")):
+                    self._reset_auth()
+                    self.authorize(cancel_event=cancel_event)
+                    endpoint = str(self.endpoint or endpoint)
+                    data = self._request_endpoint(endpoint, params, cancel_event=cancel_event, max_attempts=1)
+                else:
+                    raise
+            self._cache_put(params, data)
+            return data
+
+        def fetch(action):
+            # Compatibility sort is useful only when a portal successfully returns
+            # an empty result. Do not repeat a network timeout merely to add sortby.
             for compatibility_sort in (False, True):
                 try:
                     params = {"type": media_type, "action": action, "JsHttpRequest": "1-xml"}
                     if compatibility_sort:
                         params["sortby"] = "number"
-                    js = self._unwrap(self._get(params, use_cache=True, cancel_event=cancel_event))
+                    js = self._unwrap(request_category(params))
                     rows = self._as_list(js)
                     if rows or isinstance(js, list):
                         return rows if rows else js
+                    # Successful empty response may need the legacy sortby variant.
+                    continue
                 except PortalError as exc:
                     errors.append(str(exc))
+                    break
+            return []
+
+        def label(row):
+            if not isinstance(row, dict):
+                return str(row or "").strip()
+            return str(row.get("title") or row.get("name") or row.get("category_name") or
+                       row.get("genre_name") or row.get("label") or "").strip()
+
+        def collapsed(rows):
+            if not isinstance(rows, list) or len(rows) < 8:
+                return False
+            counts = {}
+            usable = 0
+            for row in rows:
+                text = label(row)
+                if not text:
+                    continue
+                usable += 1
+                key = text.casefold()
+                counts[key] = counts.get(key, 0) + 1
+            if usable < 8:
+                return False
+            # Trigger only on repeated short routing labels.  This catches the
+            # AR/AR/AR style response without penalising normal category lists.
+            for key, count in counts.items():
+                if count >= 3 and len(key) <= 4:
+                    return True
+            return False
+
+        def quality(rows):
+            if not isinstance(rows, list):
+                return (0, 0, 0)
+            labels = [label(row) for row in rows]
+            labels = [x for x in labels if x]
+            if not labels:
+                return (0, 0, 0)
+            distinct = len(set(x.casefold() for x in labels))
+            descriptive = sum(1 for x in labels if len(x) > 4 or any(sep in x for sep in ("|", " / ", " - ", "•")))
+            total_chars = sum(min(len(x), 80) for x in labels)
+            return (distinct, descriptive, total_chars)
+
+        if media_type == "itv":
+            primary = fetch("get_genres")
+            if primary and collapsed(primary):
+                alternate = fetch("get_categories")
+                if alternate and quality(alternate) > quality(primary):
+                    return alternate
+            if primary:
+                return primary
+        else:
+            for action in ("get_categories", "get_genres"):
+                rows = fetch(action)
+                if rows:
+                    return rows
+
         if errors:
             raise PortalError(errors[-1])
         return []
@@ -1130,13 +1980,39 @@ class StalkerClient:
     def ordered_page(self, media_type="itv", genre="*", page=1, cancel_event=None):
         """Return one native portal page plus pagination metadata.
 
-        No local sorting is performed.  The first request deliberately omits
-        ``sortby`` so the portal's own bouquet/catalogue order is respected.
+        Catalogue navigation is latency-sensitive. Once Home/authorization has
+        resolved the working MAG endpoint, use that exact endpoint for content
+        pages too. Scanning every historic loader candidate (each with retries)
+        made one category open take minutes on otherwise healthy portals.
         """
         if not self.token:
             self.authorize(cancel_event=cancel_event)
         media_type = str(media_type or "itv").lower()
-        last_error = None
+
+        def request_catalogue(params):
+            cached = self._cache_get(params)
+            if cached is not None:
+                return cached
+            endpoint = str(self.endpoint or "").strip()
+            if not endpoint:
+                return self._get(params, use_cache=True, cancel_event=cancel_event)
+            try:
+                data = self._request_endpoint(endpoint, params, cancel_event=cancel_event, max_attempts=1)
+            except PortalError as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in ("http 401", "http 403", "authorization", "token")):
+                    self._reset_auth()
+                    self.authorize(cancel_event=cancel_event)
+                    endpoint = str(self.endpoint or endpoint).strip()
+                    data = self._request_endpoint(endpoint, params, cancel_event=cancel_event, max_attempts=1)
+                else:
+                    raise
+            self._cache_put(params, data)
+            return data
+
+        # Compatibility sort is retried only after a successful empty response.
+        # A timeout/transport failure must not immediately repeat the same slow
+        # network path with a cosmetic sort parameter.
         for compatibility_sort in (False, True):
             params = {
                 "type": media_type, "action": "get_ordered_list",
@@ -1146,28 +2022,27 @@ class StalkerClient:
                 params["sortby"] = "number"
             if media_type == "itv":
                 params["genre"] = genre
+                params["force_ch_link_check"] = "1" if self._live_force_link_check else "0"
             elif media_type == "vod":
                 params["category"] = genre
             elif media_type == "series":
                 params.update({
                     "movie_id": "0", "season_id": "0", "episode_id": "0", "category": genre
                 })
-            try:
-                js = self._unwrap(self._get(params, use_cache=True, cancel_event=cancel_event))
-                rows = [row for row in self._as_list(js) if isinstance(row, dict) and row]
-                meta = js if isinstance(js, dict) else {}
-                result = {
-                    "items": rows,
-                    "page": self._int_value(meta.get("cur_page") or meta.get("page") or page or 1, page or 1),
-                    "page_size": max(1, self._int_value(meta.get("max_page_items") or meta.get("page_size") or len(rows) or 1, len(rows) or 1)),
-                    "total": max(0, self._int_value(meta.get("total_items") or meta.get("total") or 0, 0)),
-                }
-                if rows or not compatibility_sort:
-                    return result
-            except PortalError as exc:
-                last_error = exc
-        if last_error:
-            raise last_error
+            js = self._unwrap(request_catalogue(params))
+            if media_type == "itv":
+                self._remember_live_link_policy(js if isinstance(js,dict) else {})
+            rows = [row for row in self._as_list(js) if isinstance(row, dict) and row]
+            meta = js if isinstance(js, dict) else {}
+            result = {
+                "items": rows,
+                "page": self._int_value(meta.get("cur_page") or meta.get("page") or page or 1, page or 1),
+                "page_size": max(1, self._int_value(meta.get("max_page_items") or meta.get("page_size") or len(rows) or 1, len(rows) or 1)),
+                "total": max(0, self._int_value(meta.get("total_items") or meta.get("total") or 0, 0)),
+            }
+            LOG.info("CATALOGUE_DIAG type=%s category=%s page=%s rows=%s total=%s page_size=%s sort=%s", media_type, genre, page, len(rows), result.get("total"), result.get("page_size"), compatibility_sort)
+            if rows or compatibility_sort:
+                return result
         return {"items": [], "page": int(page), "page_size": 1, "total": 0}
 
     def ordered_list(self, media_type="itv", genre="*", page=1, cancel_event=None):
@@ -1276,6 +2151,262 @@ class StalkerClient:
             if not total and len(rows) < page_size: break
             page += 1
         return result
+
+    def search_content_fast(self, query, media_types=("vod","series"), limit=80, max_pages=40, cancel_event=None, time_budget=8, on_partial=None):
+        """Low-latency Stalker search with a non-destructive catalogue augment.
+
+        Phase 1 intentionally preserves the old reliable behaviour: every media
+        type gets its provider-native search turn first and every hit is published
+        immediately.  Phase 2 then augments those hits from the real category
+        catalogue, prioritising the category IDs learned from native matches.
+
+        This ordering matters on portals where a provider-wide search returns one
+        exact row while the browsable category contains several decorated copies.
+        A slow movie catalogue must never consume the whole budget before Series
+        gets its native request, and catalogue augmentation must never erase or
+        delay already-found native results.
+        """
+        started = time.monotonic()
+        needle = str(query or "").strip().casefold()
+        if not needle:
+            return []
+        limit = max(1, self._int_value(limit, 80))
+        max_pages = max(1, min(self._int_value(max_pages, 40), 80))
+        deadline = started + max(2.0, min(12.0, float(time_budget or 8)))
+        if not self.token:
+            self.authorize(cancel_event=cancel_event)
+
+        media_types = tuple(str(x).lower() for x in media_types)
+        out = []
+        seen = set()
+        native_hits = dict((typ, 0) for typ in media_types)
+        priority_categories = dict((typ, []) for typ in media_types)
+
+        def stopped(local_deadline=None):
+            cap = deadline if local_deadline is None else min(deadline, local_deadline)
+            return time.monotonic() >= cap or (cancel_event is not None and cancel_event.is_set())
+
+        def row_category(row):
+            if not isinstance(row, dict):
+                return ""
+            return str(row.get("category_id") or row.get("genre_id") or row.get("category") or row.get("genre") or "").strip()
+
+        def add_rows(rows, media_type, forced_category=""):
+            added = 0
+            for row in rows or []:
+                if stopped() or len(out) >= limit:
+                    break
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("name") or row.get("title") or row.get("id") or "")
+                hay = (title + " " + str(row.get("description") or row.get("descr") or "")).casefold()
+                if needle not in hay:
+                    continue
+                marker = (media_type, self._item_identity(row))
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                item = dict(row)
+                item["_search_media_type"] = media_type
+                if forced_category and not row_category(item):
+                    item["category_id"] = str(forced_category)
+                out.append(item)
+                added += 1
+                cid = row_category(item)
+                if cid and cid not in priority_categories.setdefault(media_type, []):
+                    priority_categories[media_type].append(cid)
+                if callable(on_partial):
+                    try:
+                        on_partial([dict(item)])
+                    except Exception:
+                        pass
+            return added
+
+        # Phase 1: native provider search for BOTH Movies and Series first.
+        # Do not scan any catalogue until every type has had this quick turn.
+        for media_type in media_types:
+            if stopped() or len(out) >= limit:
+                break
+            for search_key in ("search", "search_str", "name"):
+                if stopped():
+                    break
+                try:
+                    js = self._unwrap(self._get(
+                        self._search_params(media_type, 1, search_key, query),
+                        use_cache=False, cancel_event=cancel_event,
+                    ))
+                    native_rows = [x for x in self._as_list(js) if isinstance(x, dict)]
+                except Exception:
+                    native_rows = []
+                added = add_rows(native_rows, media_type)
+                if added:
+                    native_hits[media_type] = native_hits.get(media_type, 0) + added
+                    # One useful native key is enough. Move to the next media
+                    # type immediately so Series can never be starved by VOD.
+                    break
+
+        if stopped() or len(out) >= limit:
+            return out
+
+        # Phase 2: best-effort catalogue augmentation. Types with a native hit
+        # go first because their category IDs give us a strong, cheap hint about
+        # where sibling/decorated copies live. Remaining time is sliced fairly so
+        # a huge VOD catalogue cannot starve Series (or vice versa).
+        ordered_types = sorted(media_types, key=lambda typ: (0 if native_hits.get(typ) else 1, media_types.index(typ)))
+        for type_pos, media_type in enumerate(ordered_types):
+            if stopped() or len(out) >= limit:
+                break
+            now = time.monotonic()
+            remaining = max(0.0, deadline - now)
+            remaining_types = max(1, len(ordered_types) - type_pos)
+            type_deadline = min(deadline, now + max(0.75, remaining / float(remaining_types)))
+
+            cat_ids = list(priority_categories.get(media_type, []) or [])
+            cat_seen = set(cat_ids)
+            try:
+                categories = self.genres(media_type, cancel_event=cancel_event) or []
+            except Exception:
+                categories = []
+            for cat in categories:
+                cid = str((cat or {}).get("id") or (cat or {}).get("genre_id") or (cat or {}).get("category_id") or "").strip() if isinstance(cat, dict) else ""
+                if cid and cid not in cat_seen:
+                    cat_seen.add(cid)
+                    cat_ids.append(cid)
+            if not cat_ids:
+                cat_ids = ["*"]
+
+            exhausted = set()
+            page = 1
+            while page <= max_pages and not stopped(type_deadline) and len(out) < limit:
+                any_live = False
+                for cid in cat_ids:
+                    if stopped(type_deadline) or len(out) >= limit:
+                        break
+                    if cid in exhausted:
+                        continue
+                    any_live = True
+                    try:
+                        payload = self.ordered_page(media_type, cid, page, cancel_event=cancel_event) or {}
+                        rows = [x for x in payload.get("items", []) if isinstance(x, dict)]
+                    except Exception:
+                        exhausted.add(cid)
+                        continue
+                    if not rows:
+                        exhausted.add(cid)
+                        continue
+                    add_rows(rows, media_type, forced_category=cid)
+                    total = max(0, self._int_value(payload.get("total") or payload.get("total_items"), 0))
+                    page_size = max(1, self._int_value(payload.get("page_size") or payload.get("max_page_items"), len(rows) or 1))
+                    if total and page * page_size >= total:
+                        exhausted.add(cid)
+                    elif not total and len(rows) < page_size:
+                        exhausted.add(cid)
+                if not any_live:
+                    break
+                page += 1
+
+        return out
+
+    def search_category_fast(self, query, media_type="vod", category="*", limit=120, max_pages=18, cancel_event=None, time_budget=5):
+        """Fast search constrained to one provider folder/category.
+
+        Unlike :meth:`search_content_fast`, this never intentionally broadens to
+        the whole portal.  It asks the native ordered-list endpoint with the
+        *current* category plus the provider search key, then falls back to a
+        bounded scan of that same category only.  The UI owns the authoritative
+        full-folder fallback when a provider cannot search its category natively.
+        """
+        started=time.monotonic();needle=str(query or "").strip().casefold()
+        if not needle:return []
+        media_type=str(media_type or "vod").lower();category=str(category if category not in (None,"") else "*")
+        limit=max(1,self._int_value(limit,120));max_pages=max(1,min(self._int_value(max_pages,18),40))
+        deadline=started+max(1.5,min(10.0,float(time_budget or 5)))
+        if not self.token:self.authorize(cancel_event=cancel_event)
+        out=[];seen=set()
+        def stopped():
+            return ((cancel_event is not None and cancel_event.is_set()) or time.monotonic()>=deadline)
+        def wanted(row):
+            title=str(row.get("name") or row.get("title") or row.get("id") or "")
+            hay=(title+" "+str(row.get("description") or row.get("descr") or "")).casefold()
+            if needle not in hay:return False
+            # When the provider supplies an explicit folder marker, require it
+            # to agree with the folder we asked for.  Missing markers are common
+            # on Stalker search rows and are trusted only because the request
+            # itself is category-scoped.
+            marker=row.get("category_id")
+            if marker in (None,""):marker=row.get("category")
+            if marker in (None,""):marker=row.get("genre_id")
+            if marker in (None,""):marker=row.get("genre")
+            if marker not in (None,"") and category not in ("*","") and str(marker)!=category:
+                return False
+            return True
+        def add_rows(rows):
+            for row in rows:
+                if stopped():break
+                if not isinstance(row,dict) or not wanted(row):continue
+                ident=self._item_identity(row)
+                if ident in seen:continue
+                seen.add(ident);item=dict(row);item["_search_media_type"]=media_type;out.append(item)
+                if len(out)>=limit:return True
+            return False
+
+        # Native search, but with the CURRENT category instead of '*'.
+        for search_key in ("search","search_str","name"):
+            if stopped():break
+            page=1;native_found=False
+            while page<=max_pages and not stopped():
+                params=self._search_params(media_type,page,search_key,query)
+                if media_type=="itv":params["genre"]=category
+                else:params["category"]=category
+                try:
+                    js=self._unwrap(self._get(params,use_cache=False,cancel_event=cancel_event))
+                    rows=[x for x in self._as_list(js) if isinstance(x,dict)]
+                except Exception:
+                    rows=[];js={}
+                if not rows:break
+                # A few Stalker implementations accept the search parameter but
+                # silently ignore the requested category and return portal-wide
+                # rows.  One explicit foreign folder marker is enough to distrust
+                # that native response entirely; never mix its marker-less rows
+                # into a folder-scoped result.  Fall through to exact-folder page
+                # scanning instead.
+                foreign=False
+                if category not in ("*",""):
+                    for _row in rows:
+                        if not isinstance(_row,dict):continue
+                        _marker=_row.get("category_id")
+                        if _marker in (None,""):_marker=_row.get("category")
+                        if _marker in (None,""):_marker=_row.get("genre_id")
+                        if _marker in (None,""):_marker=_row.get("genre")
+                        if _marker not in (None,"") and str(_marker)!=category:
+                            foreign=True;break
+                if foreign:
+                    out=[];seen=set();native_found=False;break
+                before=len(out)
+                if add_rows(rows):return out
+                native_found=native_found or len(out)>before
+                meta=js if isinstance(js,dict) else {}
+                total=max(0,self._int_value(meta.get("total_items") or meta.get("total"),0))
+                page_size=max(1,self._int_value(meta.get("max_page_items") or meta.get("page_size"),len(rows) or 1))
+                if total and page*page_size>=total:break
+                if not total and len(rows)<page_size:break
+                page+=1
+            if native_found:return out
+
+        # Some portals ignore all native search keys.  Scan only the current
+        # folder, bounded by the same short UI budget.  If this returns empty,
+        # the grid performs the old complete-folder authoritative fallback.
+        page=1
+        while page<=max_pages and not stopped():
+            try:payload=self.ordered_page(media_type,category,page,cancel_event=cancel_event) or {};rows=[x for x in payload.get("items",[]) if isinstance(x,dict)]
+            except Exception:break
+            if not rows:break
+            if add_rows(rows):return out
+            total=max(0,self._int_value(payload.get("total"),0));page_size=max(1,self._int_value(payload.get("page_size"),len(rows) or 1))
+            if total and page*page_size>=total:break
+            if not total and len(rows)<page_size:break
+            page+=1
+        return out
 
     def search_content(self, query, media_types=("itv", "vod", "series"), limit=120, max_pages=None, cancel_event=None, time_budget=12):
         """Unified search with cache, cancellation and an overall time budget."""
@@ -1390,7 +2521,10 @@ class StalkerClient:
     def _series_id(item):
         if not isinstance(item, dict):
             return None
-        return item.get("id") or item.get("movie_id") or item.get("series_id")
+        # PERFLAB9: provider series_id is the authoritative portal hierarchy
+        # key.  Artwork/metadata enrichment can coexist with a generic ``id``;
+        # never let that shadow the provider series id when asking for seasons.
+        return item.get("series_id") or item.get("id") or item.get("movie_id")
 
     @staticmethod
     def _series_row_identity(row, index=0):
@@ -1676,10 +2810,60 @@ class StalkerClient:
     @staticmethod
     def _needs_create_link(raw):
         low = str(raw or "").lower()
-        # Match the working-client rule exactly: a wrapped *direct HTTP* command
-        # is already playable after removing "ffmpeg/auto" and should not be
-        # sent back to create_link.
         return "localhost" in low or "///" in low or "/ch/" in low or "http" not in low
+
+    @staticmethod
+    def _live_flag(value):
+        return str(value if value is not None else "0").strip().lower() in ("1", "true", "yes", "on")
+
+    def _remember_live_link_policy(self, payload):
+        """Learn portal-level link policy from already-authenticated responses.
+
+        Different Ministra/Stalker builds expose the switch in slightly different
+        response shapes.  Read only the known policy field and never infer it from
+        a stream URL.
+        """
+        if not isinstance(payload, dict):
+            return
+        candidates=[payload]
+        for key in ("data", "settings", "profile", "config"):
+            child=payload.get(key)
+            if isinstance(child,dict):candidates.append(child)
+        for row in candidates:
+            if "force_ch_link_check" in row:
+                self._live_force_link_check=self._live_flag(row.get("force_ch_link_check"))
+                return
+
+    def _live_link_decision(self, item, raw):
+        """Return (needs_refresh, disable_ad, force_check) for one Live row."""
+        row=item if isinstance(item,dict) else {}
+        metadata_keys=("use_http_tmp_link","use_load_balancing","disable_ad")
+        metadata_available=any(key in row for key in metadata_keys)
+        force_check=bool(self._live_force_link_check or self._live_flag(row.get("force_ch_link_check")))
+        disable_ad=self._live_flag(row.get("disable_ad"))
+        if metadata_available:
+            needs=bool(
+                self._live_flag(row.get("use_http_tmp_link"))
+                or self._live_flag(row.get("use_load_balancing"))
+                or force_check
+            )
+        else:
+            low=str(raw or "").lower()
+            needs=bool(force_check or "localhost" in low or "///" in low or "/ch/" in low or "http" not in low)
+        return needs,disable_ad,force_check
+
+    def _clean_live_url(self, value):
+        text=self._strip_player_wrapper(value)
+        if not text:return ""
+        text=re.sub(r"%mac%",self.mac,text,flags=re.IGNORECASE)
+        try:parsed=urllib.parse.urlsplit(text)
+        except Exception:return ""
+        if parsed.scheme.lower() not in self._PLAYABLE_SCHEMES:return ""
+        host=str(parsed.hostname or "").lower()
+        low=text.lower()
+        if host in ("localhost","127.0.0.1","::1") or "///" in low:
+            return ""
+        return text
 
     def _vod_media_command(self, item, media_type, cancel_event=None):
         command = str(self._extract_command(item) or "")
@@ -1711,53 +2895,179 @@ class StalkerClient:
         return command
 
     def create_link(self, item_or_cmd, media_type="itv", series_id=None, cancel_event=None):
+        # User Play owns a short priority/auth lane.  It bypasses only the
+        # temporary shared circuit pause and serializes auth mutation; catalogue,
+        # artwork and metadata workers retain their existing breaker behavior.
+        with self._auth_lock:
+            previous = bool(getattr(self._priority_local, "playback", False))
+            previous_endpoint = str(getattr(self._priority_local, "playback_endpoint", "") or "")
+            self._priority_local.playback = True
+            # Snapshot the already-proven endpoint for the whole Play action.
+            # Only a structural endpoint failure may move this pin, and a
+            # successful compatibility fallback updates it in _get_once().
+            pinned = ""
+            candidates = list(self._candidate_endpoints())
+            for candidate in (self.endpoint, self._compat_cached_endpoint):
+                candidate = str(candidate or "").strip()
+                if candidate and candidate in candidates:
+                    pinned = candidate
+                    break
+            self._priority_local.playback_endpoint = pinned
+            started = time.monotonic()
+            try:
+                # Thread-pool workers can inherit a keep-alive socket from a
+                # previous catalogue/artwork request.  Start explicit playback
+                # link resolution on a fresh transport without touching the
+                # shared token, cookies or any background worker connection.
+                try:
+                    self._drop_current_transport(close=True)
+                except Exception:
+                    pass
+                value = self._create_link_impl(
+                    item_or_cmd, media_type=media_type, series_id=series_id,
+                    cancel_event=cancel_event,
+                )
+                LOG.info("Playback link ready media=%s elapsed_ms=%d",
+                         str(media_type or "itv"), int((time.monotonic() - started) * 1000.0))
+                return value
+            except PortalCancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("Playback link failed media=%s elapsed_ms=%d error=%s",
+                            str(media_type or "itv"), int((time.monotonic() - started) * 1000.0),
+                            exc.__class__.__name__)
+                raise
+            finally:
+                self._priority_local.playback = previous
+                self._priority_local.playback_endpoint = previous_endpoint
+
+    def _create_link_impl(self, item_or_cmd, media_type="itv", series_id=None, cancel_event=None):
+        """Resolve provider playback without changing any UI/navigation behavior.
+
+        Live Stalker rows use channel metadata to decide whether middleware must
+        mint a temporary/load-balanced URL.  Direct remote commands stay direct;
+        middleware-local commands are resolved once, with one auth refresh retry.
+        VOD/series retain the established Ultra Stalker path.
+        """
         if not self.token:
             self.authorize(cancel_event=cancel_event)
-        media_type = str(media_type or "itv").lower()
-        command = self._extract_command(item_or_cmd)
-        if media_type in ("vod", "series", "episode") and isinstance(item_or_cmd, dict):
-            command = self._vod_media_command(item_or_cmd, media_type, cancel_event=cancel_event)
-        raw = str(command or "").strip().strip('"').strip("'")
+        media_type=str(media_type or "itv").lower()
+        row=item_or_cmd if isinstance(item_or_cmd,dict) else {}
+        command=self._extract_command(item_or_cmd)
+        if media_type in ("vod","series","episode") and isinstance(item_or_cmd,dict):
+            command=self._vod_media_command(item_or_cmd,media_type,cancel_event=cancel_event)
+        raw=str(command or "").strip().strip('"').strip("'")
         if not raw:
             raise PortalError("Empty stream command")
 
-        if not self._needs_create_link(raw):
-            direct = self._strip_player_wrapper(raw)
-            parsed = urllib.parse.urlsplit(direct)
-            if parsed.scheme.lower() in self._PLAYABLE_SCHEMES:
-                return direct
+        # Live has its own provider-policy state machine.
+        if media_type=="itv":
+            needs_refresh,disable_ad,force_check=self._live_link_decision(row,raw)
+            direct=self._clean_live_url(raw)
+            if not needs_refresh:
+                if direct:return direct
+                # A malformed/local command cannot safely bypass middleware.
+                needs_refresh=True
 
-        api_type = "vod" if media_type in ("series", "episode") else media_type
-        params = {
-            "type": api_type,
-            "action": "create_link",
-            "cmd": raw,
-            "series": str(series_id if series_id is not None else ("0" if api_type == "itv" else "")),
-            "forced_storage": "0" if api_type == "itv" else "",
-            "disable_ad": "0",
-            "download": "0",
-            "force_ch_link_check": "0",
-            "JsHttpRequest": "1-xml",
+            params={
+                "type":"itv",
+                "action":"create_link",
+                "cmd":raw,
+                "series":"0",
+                "forced_storage":"0",
+                "disable_ad":"1" if disable_ad else "0",
+                "download":"0",
+                "force_ch_link_check":"1" if force_check else "0",
+                "JsHttpRequest":"1-xml",
+            }
+
+            def resolve_once():
+                def request_payload():
+                    return self._unwrap(self._get(params,retry_auth=False,cancel_event=cancel_event))
+                data=self._playback_request_once_more_on_fresh_transport(request_payload)
+                if isinstance(data,dict):
+                    value=data.get("cmd") or data.get("url") or data.get("link")
+                    if not value and data.get("error"):
+                        raise PortalLinkError("Live link error: %s"%str(data.get("error")))
+                else:
+                    value=data if isinstance(data,str) else ""
+                return self._clean_live_url(value)
+
+            last_error=None
+            try:
+                resolved=resolve_once()
+                if resolved:
+                    LOG.info("Live link resolved via portal policy")
+                    return resolved
+            except PortalCancelledError:
+                raise
+            except PortalError as exc:
+                last_error=exc
+
+            # Refresh authentication only when the portal actually reports an
+            # auth/token problem.  A timeout, throttle or transport hiccup must
+            # not destroy a perfectly good session and make playback less stable.
+            if last_error is not None and self._is_auth_playback_error(last_error):
+                try:
+                    self._reset_auth()
+                    self.authorize(cancel_event=cancel_event)
+                    resolved=resolve_once()
+                    if resolved:
+                        LOG.info("Live link resolved after authorization refresh")
+                        return resolved
+                except PortalCancelledError:
+                    raise
+                except PortalError as exc:
+                    last_error=exc
+
+            if last_error:raise last_error
+            raise PortalLinkError("Portal did not return a playable live stream link")
+
+        # Existing non-Live behavior is intentionally kept separate.
+        direct_fallback=self._strip_player_wrapper(raw)
+        direct_scheme=urllib.parse.urlsplit(direct_fallback).scheme.lower() if direct_fallback else ""
+        direct_playable=direct_scheme in self._PLAYABLE_SCHEMES
+        portal_command=bool(isinstance(item_or_cmd,dict) and (
+            item_or_cmd.get("cmd") not in (None,"") or item_or_cmd.get("command") not in (None,"")
+        ))
+        if not portal_command and not self._needs_create_link(raw) and direct_playable:
+            return direct_fallback
+
+        api_type="vod" if media_type in ("series","episode") else media_type
+        params={
+            "type":api_type,"action":"create_link","cmd":raw,
+            "series":str(series_id if series_id is not None else ""),
+            "forced_storage":"","disable_ad":"0","download":"0",
+            "force_ch_link_check":"0","JsHttpRequest":"1-xml",
         }
 
         def request_link():
-            js = self._unwrap(self._get(params, retry_auth=False, cancel_event=cancel_event))
-            if isinstance(js, dict):
-                return js.get("cmd") or js.get("url") or js.get("link")
-            return js if isinstance(js, str) else None
+            def request_payload():
+                return self._unwrap(self._get(params,retry_auth=False,cancel_event=cancel_event))
+            js=self._playback_request_once_more_on_fresh_transport(request_payload)
+            if isinstance(js,dict):
+                value=js.get("cmd") or js.get("url") or js.get("link")
+                if not value and js.get("error"):
+                    raise PortalLinkError("Playback link error: %s" % str(js.get("error")))
+                return value
+            return js if isinstance(js,str) else None
 
-        value = request_link()
-        if not value:
-            self._reset_auth()
-            self.authorize(cancel_event=cancel_event)
-            value = request_link()
-        clean = self._strip_player_wrapper(value)
-        if not clean:
-            raise PortalError("Portal did not return a stream link")
-        parsed = urllib.parse.urlsplit(clean)
-        if parsed.scheme.lower() not in self._PLAYABLE_SCHEMES:
-            raise PortalError("Portal returned an unsupported stream URL")
-        return clean
+        value=None;last_error=None
+        try:value=request_link()
+        except PortalError as exc:last_error=exc
+        if not value and last_error is not None and self._is_auth_playback_error(last_error):
+            try:
+                self._reset_auth();self.authorize(cancel_event=cancel_event);value=request_link()
+            except PortalError as exc:last_error=exc
+        clean=self._strip_player_wrapper(value)
+        parsed=urllib.parse.urlsplit(clean) if clean else None
+        if clean and parsed.scheme.lower() in self._PLAYABLE_SCHEMES:
+            LOG.info("create_link refreshed")
+            return clean
+        if direct_playable:return direct_fallback
+        if last_error:raise last_error
+        if not clean:raise PortalLinkError("Portal did not return a stream link")
+        raise PortalLinkError("Portal returned an unsupported stream URL")
 
     def catchup_channels(self, genre="*", page=1, max_pages=None, cancel_event=None):
         result = []

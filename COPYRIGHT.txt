@@ -1,0 +1,15 @@
+Ultra Stalker
+Copyright (c) 2026 Ahmed L-HadarY. All rights reserved.
+
+This copyright notice applies to the original Ultra Stalker source code,
+original user interface implementation, original project documentation, and
+original project assets that are authored for Ultra Stalker.
+
+Third-party components and third-party assets bundled with Ultra Stalker are
+not claimed as original Ultra Stalker work. They remain subject to their own
+copyright notices and license terms. See THIRD_PARTY_NOTICES.txt and the
+license files shipped with those components.
+
+No rights are claimed here over external services, protocols, trademarks,
+provider data, media metadata, channel names, movie/series artwork, or other
+content supplied by third parties at runtime.

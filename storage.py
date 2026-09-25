@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import copy
+from . import _
 import hashlib
+from .language_catalog import installed_interface_language_codes, normalize_description_choice
 from .netsec import validate_http_url
 import json
 import os
@@ -19,19 +21,24 @@ DISABLED_FILE = os.path.join(CONFIG_DIR, "disabled_profiles.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.conf")
 RECOVERY_NOTICE_FILE = os.path.join(CONFIG_DIR, "recovery_notices.log")
+LIBRARY_DIR = os.path.join(CONFIG_DIR, ".uslib")
+PORTAL_LIBRARY_FILE = os.path.join(LIBRARY_DIR, ".catalog_a")
+XTREAM_LIBRARY_FILE = os.path.join(LIBRARY_DIR, ".catalog_b")
 THEMES = ("nova_fhd", "oled_black", "midnight_purple")
-DEFAULT_SETTINGS = {"theme": "nova_fhd", "service_type": 4097, "timeout": 10, "load_images": True, "epg_hours": 4, "catchup_hours": 72, "search_max_pages": 250, "image_cache_mb": 128, "persistent_cache_mb": 20480, "content_page_size": 50, "parental_lock": False, "hide_adult": True, "diagnostic_logging": False, "first_run_wizard": True, "show_live": True, "show_movies": True, "show_series": True, "show_catchup": True, "live_preview": False, "parental_pin": "0000", "parental_pin_hash": "", "parental_pin_salt": "", "hidden_categories": {"itv": [], "vod": [], "series": []}, "protected_categories": {"itv": [], "vod": [], "series": []}, "adult_keywords": ["adult", "xxx", "18+", "porn"],
+DEFAULT_SETTINGS = {"theme": "nova_fhd", "service_type": 4097, "timeout": 10, "load_images": True, "epg_hours": 4, "catchup_hours": 72, "search_max_pages": 250, "image_cache_mb": 128, "persistent_cache_mb": 20480, "content_page_size": 50, "parental_lock": False, "hide_adult": True, "diagnostic_logging": False, "first_run_wizard": False, "show_live": True, "show_movies": True, "show_series": True, "show_catchup": True, "live_preview": False, "parental_pin": "0000", "parental_pin_hash": "", "parental_pin_salt": "", "hidden_categories": {"itv": [], "vod": [], "series": []}, "hidden_categories_by_profile": {}, "protected_categories": {"itv": [], "vod": [], "series": []}, "adult_keywords": ["adult", "xxx", "18+", "porn"],
     "clean_titles": True, "show_quality_badges": True,
     "show_channel_numbers": True, "channel_list_mode": "epg", "remember_location": False,
     "smart_engine": False, "hide_empty_categories": True, "pinned_categories": {"itv": [], "vod": [], "series": []},
     "empty_categories": {"itv": [], "vod": [], "series": []}, "animations": "subtle", "prefetch_images": True,
     "show_watched": True, "parental_mode": "pin", "parental_session_minutes": 30, "download_reserve_mb": 1024,
     "smart_recovery": True, "stream_retry_count": 1, "multi_portal_search": True,
-    "tmdb_enabled": True, "tmdb_credential": "", "tmdb_language": "ar-EG",
+    "tmdb_enabled": True, "tmdb_credential": "", "tmdb_language": "ar-EG", "description_language": "ar-en",
     "proxy_port": 17999, "epg_refresh_budget": 45, "search_time_budget": 12,
     "resume_behavior": "always", "crash_safe_progress": True, "progress_save_seconds": 10,
     "next_episode_countdown": 10, "auto_remove_completed": True, "completion_threshold": 93, "completion_remaining_seconds": 180,
-    "per_title_engine": True}
+    "per_title_engine": True, "web_cleaner_access": "easy", "plugin_language": "en", "font_scale": "normal", "show_main_menu": True,
+    "onboarding_v1_completed": False, "onboarding_v2_completed": False, "onboarding_final_v9_completed": False,
+    "movies_view_mode": "cinematic", "series_view_mode": "cinematic"}
 
 MAC_RE = re.compile(r"^\s*([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{12})\s*$")
 MAC_ANY_RE = re.compile(r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{12})(?![0-9A-Fa-f])")
@@ -46,6 +53,10 @@ _SETTINGS_CACHE = None
 _SETTINGS_CACHE_SIGNATURE = None
 _API_KEYS_CACHE = None
 _API_KEYS_SIGNATURE = None
+_SETTINGS_CACHE_CHECK_MONO = 0.0
+_API_KEYS_CACHE_CHECK_MONO = 0.0
+_FILES_ENSURED = False
+_CACHE_STAT_TTL = 0.75
 STATE_IO_LOCK = threading.RLock()
 
 
@@ -71,17 +82,19 @@ def _file_signature(path):
 
 
 def _invalidate_settings_cache():
-    global _SETTINGS_CACHE, _SETTINGS_CACHE_SIGNATURE
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_SIGNATURE, _SETTINGS_CACHE_CHECK_MONO
     with _SETTINGS_CACHE_LOCK:
         _SETTINGS_CACHE = None
         _SETTINGS_CACHE_SIGNATURE = None
+        _SETTINGS_CACHE_CHECK_MONO = 0.0
 
 
 def _invalidate_api_keys_cache():
-    global _API_KEYS_CACHE, _API_KEYS_SIGNATURE
+    global _API_KEYS_CACHE, _API_KEYS_SIGNATURE, _API_KEYS_CACHE_CHECK_MONO
     with _SETTINGS_CACHE_LOCK:
         _API_KEYS_CACHE = None
         _API_KEYS_SIGNATURE = None
+        _API_KEYS_CACHE_CHECK_MONO = 0.0
     _invalidate_settings_cache()
 
 
@@ -147,8 +160,14 @@ def load_json_file(path, expected_type, default):
 
 
 
-def ensure_files():
+def ensure_files(force=False):
+    """Ensure config files once per process; avoid rescanning them on every settings read."""
+    global _FILES_ENSURED
+    if _FILES_ENSURED and not force:
+        return
     with STATE_IO_LOCK:
+        if _FILES_ENSURED and not force:
+            return
         os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
         try:
             os.chmod(CONFIG_DIR, 0o700)
@@ -167,7 +186,9 @@ def ensure_files():
             try:
                 with open(API_KEYS_FILE, "w", encoding="utf-8") as handle:
                     handle.write("# Ultra Stalker API credentials\n")
-                    handle.write("TMDB_API_KEY=\nTMDB_READ_TOKEN=\nIMDB_API_KEY=\nIMDB_API_ENDPOINT=\nSUBDL_API_KEY=\n")
+                    handle.write("TMDB_API_KEY=\nTMDB_READ_TOKEN=\nIMDB_API_KEY=\nIMDB_API_ENDPOINT=\nSUBDL_API_KEY=\nSUBSOURCE_API_KEY=\n")
+                    handle.write("FANART_API_KEY=a13e8825394b61f42d0f34b0b2b90eb9\n")
+                    handle.write("FANART_CLIENT_KEY=d9e41c82d5b199f6d3ead16fafc26d89\n")
                     handle.flush(); os.fsync(handle.fileno())
                 os.chmod(API_KEYS_FILE, 0o600)
             except OSError as exc:
@@ -185,15 +206,33 @@ def ensure_files():
                     stripped = raw.strip()
                     if stripped and not stripped.startswith(("#", ";")) and "=" in stripped:
                         existing.add(stripped.split("=", 1)[0].strip().upper())
-                missing = [k for k in ("TMDB_API_KEY","TMDB_READ_TOKEN","IMDB_API_KEY","IMDB_API_ENDPOINT","SUBDL_API_KEY") if k not in existing]
-                if missing:
+                defaults = {
+                    "FANART_API_KEY": "a13e8825394b61f42d0f34b0b2b90eb9",
+                    "FANART_CLIENT_KEY": "d9e41c82d5b199f6d3ead16fafc26d89",
+                }
+                standard_keys=("TMDB_API_KEY","TMDB_READ_TOKEN","IMDB_API_KEY","IMDB_API_ENDPOINT","SUBDL_API_KEY","SUBSOURCE_API_KEY","FANART_API_KEY","FANART_CLIENT_KEY")
+                missing = [k for k in standard_keys if k not in existing]
+                empty_default_keys=set()
+                for raw in current_lines:
+                    stripped=raw.strip()
+                    if stripped and not stripped.startswith(("#",";")) and "=" in stripped:
+                        key,value=stripped.split("=",1);key=key.strip().upper();value=value.strip()
+                        if key in defaults and not value:empty_default_keys.add(key)
+                if missing or empty_default_keys:
                     temp = API_KEYS_FILE + ".migrate.%d.%d" % (os.getpid(), threading.get_ident())
                     with open(temp, "w", encoding="utf-8") as handle:
-                        handle.writelines(current_lines)
+                        for raw in current_lines:
+                            stripped=raw.strip()
+                            if stripped and not stripped.startswith(("#",";")) and "=" in stripped:
+                                key,value=stripped.split("=",1);key=key.strip().upper();value=value.strip()
+                                if key in defaults and not value:
+                                    handle.write("%s=%s\n" % (key,defaults[key]))
+                                    continue
+                            handle.write(raw if raw.endswith("\n") else raw+"\n")
                         if current_lines and current_lines[-1].strip():
                             handle.write("\n")
                         for key in missing:
-                            handle.write("%s=\n" % key)
+                            handle.write("%s=%s\n" % (key, defaults.get(key,"")))
                         handle.flush(); os.fsync(handle.fileno())
                     os.chmod(temp, 0o600)
                     os.replace(temp, API_KEYS_FILE)
@@ -201,6 +240,8 @@ def ensure_files():
                     _invalidate_api_keys_cache()
             except OSError as exc:
                 LOG.warning('API keys migration failed: %s', exc)
+        _FILES_ENSURED = bool(os.path.isdir(CONFIG_DIR) and os.path.isfile(IMPORT_FILE) and os.path.isfile(API_KEYS_FILE))
+
 
 def _looks_like_m3u_profile_url(value):
     low=str(value or "").strip().lower()
@@ -274,6 +315,18 @@ def _normalize_profile(profile, default_source="saved"):
     name = str(profile.get("name") or "").strip()
     if name:
         result["name"] = name[:80]
+    # Optional provider-reported connection telemetry. Purely descriptive.
+    for field in ("active_connections", "max_connections"):
+        try:
+            value = int(profile.get(field))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= value <= 999:
+            result[field] = value
+    connection_source = str(profile.get("connections_source") or "").strip().lower()
+    if connection_source == "provider_exact":
+        result["connections_source"] = connection_source
+
     return result
 
 
@@ -474,6 +527,138 @@ def _parse_import_lines(lines, result, seen):
                         pending_macs.append(mac)
     commit_xtream()
     return result
+
+
+
+def _library_file(kind):
+    return XTREAM_LIBRARY_FILE if str(kind or "").lower() == "xtream" else PORTAL_LIBRARY_FILE
+
+def ensure_server_library_files():
+    """Create passive local catalog files. They are never scanned during normal startup."""
+    ensure_files()
+    try:
+        os.makedirs(LIBRARY_DIR, mode=0o700, exist_ok=True)
+        os.chmod(LIBRARY_DIR, 0o700)
+    except OSError as exc:
+        LOG.debug("server library directory init failed: %s", exc)
+    for kind, path in (("portal", PORTAL_LIBRARY_FILE), ("xtream", XTREAM_LIBRARY_FILE)):
+        if os.path.exists(path):
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# Ultra Stalker %s catalog\n" % kind)
+                handle.write("# Passive text catalog: no validation or network work occurs until imported.\n")
+                handle.flush(); os.fsync(handle.fileno())
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            LOG.warning("server library file init failed: %s", exc)
+
+def _library_display_name(profile, index):
+    name=str((profile or {}).get("name") or "").strip()
+    if name:
+        return name[:80]
+    raw=str((profile or {}).get("portal") or "")
+    try:
+        parsed=urllib.parse.urlsplit(raw)
+        host=parsed.hostname or parsed.netloc
+        if host:
+            return str(host)[:80]
+    except Exception:
+        pass
+    return ((_("Xtream Server %d") if str((profile or {}).get("source_type") or "").lower()=="m3u" else _("Portal Server %d")) % (int(index)+1))
+
+def load_server_library(kind):
+    """Parse one passive catalog on demand, without network or profile initialization."""
+    kind=str(kind or "").lower()
+    if kind not in ("portal", "xtream"):
+        return []
+    ensure_server_library_files()
+    path=_library_file(kind)
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            lines=handle.readlines()
+    except OSError:
+        return []
+    rows=[]; seen=set()
+    # Reuse the mature import parser first. It is text-only and performs no I/O beyond parsing.
+    parsed=[]
+    try:
+        _parse_import_lines(lines, parsed, set())
+    except Exception as exc:
+        LOG.warning("server library parse failed: %s", exc)
+        parsed=[]
+    # Preserve optional display names on common pipe-separated Portal rows.
+    if kind == "portal":
+        named = {}
+        for raw in lines:
+            line=str(raw or "").strip()
+            if not line or line.startswith(("#",";","//")) or "|" not in line:
+                continue
+            parts=[x.strip().strip('"\'') for x in line.split("|")]
+            url_idx=next((i for i,x in enumerate(parts) if x.lower().startswith(("http://","https://"))),None)
+            mac_idx=next((i for i,x in enumerate(parts) if MAC_RE.match(x)),None)
+            if url_idx is None or mac_idx is None:
+                continue
+            candidate=_normalize_profile({"portal":parts[url_idx],"mac":parts[mac_idx],"source":"library","source_type":"stalker"},"library")
+            if candidate and url_idx>0 and parts[0]:
+                named[_profile_key(candidate)]=parts[0][:80]
+        for item in parsed:
+            key=_profile_key(item)
+            if key in named:item["name"]=named[key]
+
+    # Supplement common single-line Xtream forms: URL|USER|PASS and NAME|URL|USER|PASS.
+    if kind == "xtream":
+        for raw in lines:
+            line=str(raw or "").strip()
+            if not line or line.startswith(("#",";","//")) or "|" not in line:
+                continue
+            parts=[x.strip().strip('"\'') for x in line.split("|")]
+            url_idx=next((i for i,x in enumerate(parts) if x.lower().startswith(("http://","https://"))),None)
+            if url_idx is None or len(parts) < url_idx+3:
+                continue
+            url,user,pwd=parts[url_idx],parts[url_idx+1],parts[url_idx+2]
+            full=_xtream_playlist_url(url,user,pwd)
+            if full:
+                p=_normalize_profile({"portal":full,"source":"library","source_type":"m3u","name":parts[0] if url_idx>0 else ""},"library")
+                if p: parsed.append(p)
+    for profile in parsed:
+        p=_normalize_profile(profile, "library")
+        if not p:
+            continue
+        st=str(p.get("source_type") or "stalker").lower()
+        if kind == "portal" and st != "stalker":
+            continue
+        if kind == "xtream" and st != "m3u":
+            continue
+        key=_profile_key(p)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        p=dict(p); p["source"]="library"; p["name"]=_library_display_name(p,len(rows))
+        rows.append(p)
+    return rows
+
+def import_server_library_profiles(items):
+    """Copy selected catalog rows into normal saved profiles; no network checks are performed."""
+    selected=[]
+    for raw in items if isinstance(items,list) else []:
+        p=_normalize_profile(raw,"library")
+        if p:
+            p=dict(p); p["source"]="library"; selected.append(p)
+    if not selected:
+        return {"added":0,"duplicates":0,"total":0}
+    existing=load_profiles()
+    existing_keys=set(k for k in (_profile_key(x) for x in existing) if k)
+    saved=_read_json_profiles()
+    added=0; dup=0
+    for p in selected:
+        key=_profile_key(p)
+        if not key or key in existing_keys:
+            dup+=1; continue
+        existing_keys.add(key); saved.append(p); added+=1
+    if added:
+        save_profiles(saved)
+    return {"added":added,"duplicates":dup,"total":len(selected)}
 
 def parse_import_file():
     """Parse portal imports permissively and isolate malformed lines.
@@ -700,11 +885,20 @@ def reorder_profile(profile, delta):
 
 
 def _remove_profile_from_import_path(profile, path):
-    """Remove one portal/MAC pair from one import file safely."""
-    key = _profile_key(profile)
-    if not key or not path or not os.path.isfile(path):
+    """Remove one source identity from a text import file, including annotated MAC rows.
+
+    Historical portal lists often store rows as ``MAC - expiry`` rather than a
+    bare MAC.  The former deleter only matched a line containing *only* the MAC,
+    so the entry was removed from profiles.json and immediately resurrected by
+    load_profiles().  Treat any MAC found inside the active portal block as the
+    same identity.  Standalone M3U/get.php URLs are removed by URL identity.
+    """
+    normalized = _normalize_profile(profile)
+    key = _profile_key(normalized)
+    if not normalized or not key or not path or not os.path.isfile(path):
         return False
     target_portal, target_mac = key
+    target_is_m3u = str(normalized.get("source_type") or "").lower() == "m3u"
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
             lines = handle.readlines()
@@ -716,45 +910,58 @@ def _remove_profile_from_import_path(profile, path):
     changed = False
     for raw in lines:
         stripped = raw.strip()
-        if not stripped or stripped.startswith(("#", ";", "//")):
+        if not stripped:
             output.append(raw)
-            if not stripped:
-                current_portal = None
+            current_portal = None
+            continue
+        if stripped.startswith(("#", ";", "//")):
+            output.append(raw)
             continue
 
         portal = _extract_portal(stripped)
         macs = _extract_macs(stripped)
         if portal:
             try:
-                normalized_portal = _normalize_profile(
-                    {"portal": portal, "mac": target_mac, "source": "text"}, "text"
-                )
-                current_portal = _profile_key(normalized_portal)[0] if normalized_portal else None
+                candidate = _normalize_profile({
+                    "portal": portal,
+                    "mac": "" if target_is_m3u else target_mac,
+                    "source": "text",
+                    "source_type": "m3u" if target_is_m3u else "stalker",
+                }, "text")
+                current_portal = _profile_key(candidate)[0] if candidate else None
             except Exception:
                 current_portal = None
 
-            # URL + MAC on the same line.
-            if current_portal == target_portal and target_mac in macs:
+            # Standalone M3U/Xtream source: deleting the URL line deletes the
+            # imported source itself, not merely its saved JSON mirror.
+            if target_is_m3u and current_portal == target_portal:
+                changed = True
+                current_portal = None
+                continue
+
+            # Portal + MAC on one line.  Keep any other MACs, but remove the
+            # selected identity regardless of trailing expiry/comment text.
+            if (not target_is_m3u and current_portal == target_portal and
+                    target_mac in macs):
                 remaining = [m for m in macs if m != target_mac]
-                if remaining:
-                    # Preserve the portal and remaining MACs in an unambiguous form.
-                    output.append(str(portal).rstrip("/") + "\n")
-                    for mac in remaining:
-                        output.append(mac + "\n")
-                else:
-                    # Keep a bare URL only if following grouped MACs may still belong to it.
-                    output.append(str(portal).rstrip("/") + "\n")
+                output.append(str(portal).rstrip("/") + "\n")
+                for mac in remaining:
+                    output.append(mac + "\n")
                 changed = True
                 continue
 
             output.append(raw)
             continue
 
-        # Grouped MAC line under a previously seen portal.
-        mac_only = MAC_RE.match(stripped)
-        if mac_only and current_portal == target_portal and _canonical_mac(mac_only.group(1)) == target_mac:
+        # Grouped MAC rows may be ``MAC``, ``MAC - expiry``, ``MAC | note`` etc.
+        # Match the MAC token, not the entire line.
+        if not target_is_m3u and current_portal == target_portal and target_mac in macs:
+            remaining = [m for m in macs if m != target_mac]
+            for mac in remaining:
+                output.append(mac + "\n")
             changed = True
             continue
+
         output.append(raw)
 
     if not changed:
@@ -776,7 +983,6 @@ def _remove_profile_from_import_path(profile, path):
         except OSError as exc:
             LOG.debug('import temp cleanup failed: %s', exc)
     return True
-
 
 def _remove_profile_from_import(profile):
     """Remove a portal/MAC pair from all current and compatibility import files."""
@@ -848,10 +1054,15 @@ def permanently_delete_profile(profile, session=None, purge_related=True):
 
 
 def load_api_keys():
-    """Read external API credentials with mtime/size based caching."""
-    global _API_KEYS_CACHE, _API_KEYS_SIGNATURE
+    """Read API credentials with a short stat debounce plus mtime/size validation."""
+    global _API_KEYS_CACHE, _API_KEYS_SIGNATURE, _API_KEYS_CACHE_CHECK_MONO
+    now = time.monotonic()
+    with _SETTINGS_CACHE_LOCK:
+        if _API_KEYS_CACHE is not None and (now - _API_KEYS_CACHE_CHECK_MONO) < _CACHE_STAT_TTL:
+            return dict(_API_KEYS_CACHE)
     signature = _file_signature(API_KEYS_FILE)
     with _SETTINGS_CACHE_LOCK:
+        _API_KEYS_CACHE_CHECK_MONO = now
         if _API_KEYS_CACHE is not None and signature == _API_KEYS_SIGNATURE:
             return dict(_API_KEYS_CACHE)
     values = {}
@@ -870,9 +1081,33 @@ def load_api_keys():
         pass
     except OSError as exc:
         LOG.warning('API keys read failed: %s', exc)
+    # R269: restore the bundled device/provider credentials introduced in R253.
+    # Explicit user values in api_keys.conf always win and bundled values are
+    # never written back to disk. TMDb is one credential family: if any user
+    # TMDb token/key is present, do not inject a bundled sibling.
+    try:
+        from .builtin_credentials import builtin_api_credentials
+        bundled = builtin_api_credentials() or {}
+    except Exception as exc:
+        LOG.debug("bundled API credential decode failed: %s", exc)
+        bundled = {}
+    if not any(str(values.get(k) or "").strip() for k in ("TMDB_READ_TOKEN", "TMDB_API_TOKEN", "TMDB_API_KEY")):
+        tmdb_default = str(bundled.get("TMDB_API_KEY") or "").strip()
+        if tmdb_default:
+            values["TMDB_API_KEY"] = tmdb_default
+    for key in ("SUBDL_API_KEY", "SUBSOURCE_API_KEY"):
+        if not str(values.get(key) or "").strip():
+            default_value = str(bundled.get(key) or "").strip()
+            if default_value:
+                values[key] = default_value
+
+    # Existing Fanart defaults keep their historical behavior.
+    values.setdefault("FANART_API_KEY", "a13e8825394b61f42d0f34b0b2b90eb9")
+    values.setdefault("FANART_CLIENT_KEY", "d9e41c82d5b199f6d3ead16fafc26d89")
     with _SETTINGS_CACHE_LOCK:
         _API_KEYS_CACHE = dict(values)
         _API_KEYS_SIGNATURE = signature
+        _API_KEYS_CACHE_CHECK_MONO = time.monotonic()
     return values
 
 def update_api_keys(updates):
@@ -942,6 +1177,14 @@ def save_tmdb_credential(value):
         "TMDB_API_TOKEN": "",
     }
     update_api_keys(updates)
+    # R113: credential activation atomically detaches the temporary provider
+    # bootstrap cache.  Physical deletion is daemonized, so saving Settings never
+    # blocks on a large artwork tree.
+    try:
+        from .provider_bootstrap import reconcile_tmdb_state
+        reconcile_tmdb_state(force=True)
+    except Exception as exc:
+        LOG.warning("Provider bootstrap credential transition failed: %s", exc)
     return value
 
 
@@ -975,10 +1218,15 @@ def _load_settings_file_raw():
     return load_json_file(SETTINGS_FILE, dict, {})
 
 def load_settings():
-    global _SETTINGS_CACHE, _SETTINGS_CACHE_SIGNATURE
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_SIGNATURE, _SETTINGS_CACHE_CHECK_MONO
     ensure_files()
+    now = time.monotonic()
+    with _SETTINGS_CACHE_LOCK:
+        if _SETTINGS_CACHE is not None and (now - _SETTINGS_CACHE_CHECK_MONO) < _CACHE_STAT_TTL:
+            return copy.deepcopy(_SETTINGS_CACHE)
     signature = (_file_signature(SETTINGS_FILE), _file_signature(API_KEYS_FILE))
     with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE_CHECK_MONO = now
         if _SETTINGS_CACHE is not None and signature == _SETTINGS_CACHE_SIGNATURE:
             return copy.deepcopy(_SETTINGS_CACHE)
     data = load_json_file(SETTINGS_FILE, dict, {})
@@ -1001,7 +1249,7 @@ def load_settings():
         try: result[key] = max(low, min(high, int(result.get(key, default))))
         except (TypeError, ValueError): result[key] = default
     result["load_images"] = bool(result.get("load_images", True))
-    for key in ("show_live", "show_movies", "show_series", "show_catchup", "live_preview", "parental_lock", "hide_adult", "diagnostic_logging", "first_run_wizard", "clean_titles", "show_quality_badges", "show_channel_numbers", "remember_location", "smart_engine", "hide_empty_categories", "prefetch_images", "show_watched", "smart_recovery", "multi_portal_search", "tmdb_enabled", "crash_safe_progress", "auto_remove_completed", "per_title_engine"):
+    for key in ("show_live", "show_movies", "show_series", "show_catchup", "live_preview", "parental_lock", "hide_adult", "diagnostic_logging", "first_run_wizard", "clean_titles", "show_quality_badges", "show_channel_numbers", "remember_location", "smart_engine", "hide_empty_categories", "prefetch_images", "show_watched", "smart_recovery", "multi_portal_search", "tmdb_enabled", "crash_safe_progress", "auto_remove_completed", "per_title_engine", "show_main_menu", "onboarding_v1_completed", "onboarding_v2_completed", "onboarding_final_v9_completed"):
         result[key] = bool(result.get(key, DEFAULT_SETTINGS.get(key, False)))
     # Playback engine is explicitly user-owned. Legacy Smart Engine/per-title
     # preferences are retained on disk for downgrade compatibility but are never
@@ -1016,6 +1264,20 @@ def load_settings():
         result["parental_mode"] = "pin"
     if result.get("resume_behavior") not in ("ask", "always", "start"):
         result["resume_behavior"] = "ask"
+    access_mode = str(result.get("web_cleaner_access") or "easy").strip().lower()
+    result["web_cleaner_access"] = access_mode if access_mode in ("easy", "protected") else "easy"
+    plugin_language = str(result.get("plugin_language") or "en").strip().lower()
+    result["plugin_language"] = plugin_language if plugin_language in installed_interface_language_codes() else "en"
+    # Description language is independent from Interface Language and from the
+    # long-standing internal TMDb metadata mode used by artwork/title-logo.
+    # Migrate the temporary R140 "current" value to the equivalent explicit
+    # choice without changing that internal metadata mode.
+    _description_choice = normalize_description_choice(result.get("description_language"))
+    if _description_choice == "current":
+        _description_choice = "en-US" if str(result.get("tmdb_language") or "ar-EG") == "en-US" else "ar-en"
+    result["description_language"] = _description_choice
+    font_scale = str(result.get("font_scale") or "normal").strip().lower()
+    result["font_scale"] = font_scale if font_scale in ("normal", "large", "larger", "xlarge") else "normal"
     pin = str(result.get("parental_pin", "0000"))
     result["parental_pin"] = pin if (not pin or (pin.isdigit() and 4 <= len(pin) <= 8)) else "0000"
     pin_hash = str(result.get("parental_pin_hash") or "").strip().lower()
@@ -1045,6 +1307,17 @@ def load_settings():
     hidden = result.get("hidden_categories")
     if not isinstance(hidden, dict): hidden = {}
     result["hidden_categories"] = {k: [str(x) for x in hidden.get(k, []) if str(x).strip()] for k in ("itv", "vod", "series")}
+    scoped_hidden = result.get("hidden_categories_by_profile")
+    if not isinstance(scoped_hidden, dict): scoped_hidden = {}
+    cleaned_scoped = {}
+    for profile_key, bucket in scoped_hidden.items():
+        if not isinstance(bucket, dict): continue
+        clean_bucket = {}
+        for media_key in ("itv", "vod", "series"):
+            if media_key in bucket:
+                clean_bucket[media_key] = [str(x) for x in bucket.get(media_key, []) if str(x).strip()] if isinstance(bucket.get(media_key), list) else []
+        if clean_bucket: cleaned_scoped[str(profile_key)] = clean_bucket
+    result["hidden_categories_by_profile"] = cleaned_scoped
     for setting_name in ("pinned_categories", "empty_categories", "protected_categories"):
         values = result.get(setting_name)
         if not isinstance(values, dict): values = {}
@@ -1090,12 +1363,15 @@ def load_settings():
     result["imdb_revision_id"] = str(api.get("IMDB_REVISION_ID") or "").strip()[:512]
     result["imdb_asset_id"] = str(api.get("IMDB_ASSET_ID") or "").strip()[:512]
     result["subdl_api_key"] = str(api.get("SUBDL_API_KEY") or "").strip()[:4096]
+    result["subsource_api_key"] = str(api.get("SUBSOURCE_API_KEY") or "").strip()[:4096]
+    result["fanart_api_key"] = str(api.get("FANART_API_KEY") or "").strip()[:4096]
     result["api_keys_file"] = API_KEYS_FILE
     result["api_keys_file_exists"] = os.path.isfile(API_KEYS_FILE)
     signature = (_file_signature(SETTINGS_FILE), _file_signature(API_KEYS_FILE))
     with _SETTINGS_CACHE_LOCK:
         _SETTINGS_CACHE = copy.deepcopy(result)
         _SETTINGS_CACHE_SIGNATURE = signature
+        _SETTINGS_CACHE_CHECK_MONO = time.monotonic()
     return copy.deepcopy(result)
 
 
@@ -1148,43 +1424,86 @@ def save_theme(theme):
 
 
 # Content persistence is centralized in SQLite repositories.
-from .repositories.content import FAVORITES, HISTORY
+# PERF40: keep sqlite3/repository initialization off the cold ui.py import path.
+# Home/Settings/Portal browsing do not need the database until a favorite/history
+# API is actually used.  The public storage API remains unchanged.
+_CONTENT_REPOSITORIES = None
+_CONTENT_REPOSITORIES_LOCK = threading.RLock()
+# In-process history revision. Home uses this as a zero-I/O dirty token so
+# Recent cards stay fully resident across child screens and rebuild only after
+# playback/history actually changes. It intentionally resets on Enigma restart;
+# cold Home still loads SQLite once as before.
+_HISTORY_REVISION = 0
+_HISTORY_REVISION_LOCK = threading.RLock()
+
+def _bump_history_revision():
+    global _HISTORY_REVISION
+    with _HISTORY_REVISION_LOCK:
+        _HISTORY_REVISION += 1
+        return _HISTORY_REVISION
+
+def history_revision():
+    with _HISTORY_REVISION_LOCK:
+        return int(_HISTORY_REVISION)
+
+def _content_repositories():
+    global _CONTENT_REPOSITORIES
+    repos = _CONTENT_REPOSITORIES
+    if repos is not None:
+        return repos
+    with _CONTENT_REPOSITORIES_LOCK:
+        repos = _CONTENT_REPOSITORIES
+        if repos is None:
+            from .repositories.content import FAVORITES, HISTORY
+            repos = (FAVORITES, HISTORY)
+            _CONTENT_REPOSITORIES = repos
+        return repos
 
 def load_favorites():
-    return FAVORITES.list()
+    return _content_repositories()[0].list()
 
 def toggle_favorite(profile, media_type, item):
-    return FAVORITES.toggle(profile, media_type, item)
+    return _content_repositories()[0].toggle(profile, media_type, item)
 
 def is_favorite(profile, media_type, item):
-    return FAVORITES.contains(profile, media_type, item)
+    return _content_repositories()[0].contains(profile, media_type, item)
 
 def load_content_states(profile, media_type, items):
     """Return favorite/resume state aligned with ``items`` using bulk SQLite reads."""
-    return FAVORITES.states(profile, media_type, items)
+    return _content_repositories()[0].states(profile, media_type, items)
 
 def load_recently_played():
-    return HISTORY.list()
+    return _content_repositories()[1].list()
 
 def add_recently_played(profile, media_type, item, position=0, duration=0, completed=False, force=False):
-    HISTORY.save(profile, media_type, item, position, duration, completed, force=force)
+    result = _content_repositories()[1].save(profile, media_type, item, position, duration, completed, force=force)
+    _bump_history_revision()
+    return result
 
 def touch_recently_played(profile, media_type, item):
     """Update Last Played ordering without changing saved resume position."""
-    HISTORY.touch(profile, media_type, item)
+    result = _content_repositories()[1].touch(profile, media_type, item)
+    _bump_history_revision()
+    return result
 
 def load_playback_progress(profile, media_type, item):
-    return HISTORY.progress(profile, media_type, item)
+    return _content_repositories()[1].progress(profile, media_type, item)
 
 
 def load_continue_watching():
-    return HISTORY.continue_list()
+    return _content_repositories()[1].continue_list()
 
 def mark_watched(profile, media_type, item, watched=True):
-    return HISTORY.mark_watched(profile, media_type, item, watched)
+    result = _content_repositories()[1].mark_watched(profile, media_type, item, watched)
+    _bump_history_revision()
+    return result
 
 def remove_from_history(profile, media_type, item):
-    return HISTORY.remove(profile, media_type, item)
+    result = _content_repositories()[1].remove(profile, media_type, item)
+    _bump_history_revision()
+    return result
 
 def clear_history(profile=None):
-    return HISTORY.clear(profile)
+    result = _content_repositories()[1].clear(profile)
+    _bump_history_revision()
+    return result

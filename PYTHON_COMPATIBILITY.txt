@@ -1,4 +1,23 @@
-Ultra Stalker 10.1.0-beta57-rc4-secfix14-ui10
-Official Python support: CPython 3.13.x and 3.14.x (GIL-enabled Enigma2 builds).
-Target images: OpenBH 5.6 (Python 3.13) and OpenBH 6.0 (Python 3.14).
-Free-threaded/no-GIL Python builds are intentionally rejected.
+Ultra Stalker Final V9.1.1
+Python compatibility policy
+===========================
+
+Declared support
+- CPython 3.12, 3.13, 3.14 and 3.15 standard-GIL builds on Enigma2.
+- Free-threaded/no-GIL builds are intentionally unsupported.
+- The package control metadata declares: Python-Support: 3.12, 3.13, 3.14, 3.15.
+
+Runtime authority
+- compat.py is the executable compatibility/preflight authority.
+- MIN_PYTHON = 3.12.
+- SUPPORTED_PYTHONS = 3.12 / 3.13 / 3.14 / 3.15.
+- Newer CPython versions are allowed in forward-compatible/untested mode rather than blocking plugin discovery.
+- Runtime preflight checks sqlite3, Pillow/PIL, Twisted and required Enigma2 Python modules.
+
+Packaging / images
+- IPK/opkg path targets OE-style Enigma2 images.
+- DEB/dpkg path targets DreamOS-compatible images where the required Python/Enigma2 dependencies are available.
+
+Validation status
+- Source syntax/compile checks can be performed in the build environment.
+- Receiver smoke/soak remains required for each materially different Enigma2 image and Python minor, especially 3.12, 3.14 and 3.15, because host-side compilation cannot prove receiver ABI/module availability.

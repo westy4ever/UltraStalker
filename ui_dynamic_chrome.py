@@ -18,20 +18,45 @@ except Exception:
 from .log import optional_failure
 from .ui_dynamic_palette import _dynamic_palette
 from .ui_helpers import _lift_dynamic_accent, _mix_rgb
+from .core.image_budget import image_budgeted
 
 THUMB_CACHE_DIR = ""
 CATEGORY_ADAPTIVE_TMP_DIR = ""
+DETAILS_ADAPTIVE_CACHE_DIR = ""
 _persistent_write_ok = None
 _persistent_write_require = None
 _valid_cache_file = None
 
-def configure_dynamic_chrome(thumb_cache_dir, persistent_write_ok, persistent_write_require, valid_cache_file, category_adaptive_tmp_dir=""):
-    global THUMB_CACHE_DIR, CATEGORY_ADAPTIVE_TMP_DIR, _persistent_write_ok, _persistent_write_require, _valid_cache_file
+def configure_dynamic_chrome(thumb_cache_dir, persistent_write_ok, persistent_write_require, valid_cache_file, category_adaptive_tmp_dir="", details_adaptive_cache_dir=""):
+    global THUMB_CACHE_DIR, CATEGORY_ADAPTIVE_TMP_DIR, DETAILS_ADAPTIVE_CACHE_DIR, _persistent_write_ok, _persistent_write_require, _valid_cache_file
     THUMB_CACHE_DIR = thumb_cache_dir
     CATEGORY_ADAPTIVE_TMP_DIR = category_adaptive_tmp_dir
+    DETAILS_ADAPTIVE_CACHE_DIR = details_adaptive_cache_dir or thumb_cache_dir
     _persistent_write_ok = persistent_write_ok
     _persistent_write_require = persistent_write_require
     _valid_cache_file = valid_cache_file
+
+
+def canonical_dynamic_details_key(source_path):
+    """Return the shared cache identity for Details-style adaptive chrome.
+
+    Screen names must never participate in this key. The same source artwork
+    revision therefore produces one reusable 24-file chrome bundle whether it
+    is requested by Details, Cinematic focus or Backdrop Grid.
+    """
+    try:
+        from .core.generated_cache import canonical_dynamic_details_key as _canonical
+        return _canonical(source_path)
+    except Exception:
+        return ""
+
+def canonical_dynamic_rows_key(source_path, selected_rim_only=False, cinematic_premium=False):
+    try:
+        from .core.generated_cache import canonical_dynamic_rows_key as _canonical
+        return _canonical(source_path, selected_rim_only=selected_rim_only, cinematic_premium=cinematic_premium)
+    except Exception:
+        return ""
+
 
 def _build_dynamic_details_gradient(source_path,target_path,size=(1920,1080)):
     if not _persistent_write_ok(THUMB_CACHE_DIR): return None
@@ -102,7 +127,8 @@ def _build_dynamic_poster_accent(source_path,target_path,size=(360,640)):
 
 
 def _build_dynamic_details_chrome(source_path, cache_key):
-    if not _persistent_write_ok(THUMB_CACHE_DIR): return {}
+    cache_root = DETAILS_ADAPTIVE_CACHE_DIR or THUMB_CACHE_DIR
+    if not _persistent_write_ok(cache_root): return {}
     """Generate subdued UI chrome whose edges follow the current artwork palette.
 
     Only borders, corner glints and very light glass tints follow the artwork.
@@ -117,14 +143,12 @@ def _build_dynamic_details_chrome(source_path, cache_key):
         base=(3,12,20)
         specs={
             "panel":((1388,410),30,True),
-            "panel_detail":((1460,410),30,True),
+            "panel_detail":((1410,368),30,True),
             "overview":((1283,142),22,True),
-            "overview_detail":((1368,142),22,True),
-            "poster_card":((360,560),22,True),
-            "poster_overlay":((360,560),22,True),
-            "cast_card":((620,106),18,True),
+            "overview_detail":((1318,170),22,True),
+            "cast_card":((585,106),18,True),
             "director_card":((285,106),18,True),
-            "writer_card":((430,106),18,True),
+            "writer_card":((418,106),18,True),
             "cast_card_ep":((555,106),18,True),
             "director_card_ep":((260,106),18,True),
             "writer_card_ep":((430,106),18,True),
@@ -135,23 +159,44 @@ def _build_dynamic_details_chrome(source_path, cache_key):
             "runtime":((150,50),22,False),
             "country":((160,50),22,False),
             "genre":((815,40),19,False),
-            "genre_detail":((850,40),19,False),
+            "genre_detail":((680,50),22,False),
+            "cast_detail":((1318,50),22,False),
             "rating_pill":((130,42),18,False),
             "episodes_panel":((430,782),20,True),
             "series_row":((426,72),22,False),
             "series_row_selected":((426,72),22,False),
         }
         result={}
+        try: os.makedirs(cache_root,mode=0o700,exist_ok=True)
+        except Exception: return {}
         for name,(size,radius,is_panel) in specs.items():
-            target=os.path.join(THUMB_CACHE_DIR,"dyn220laser_%s_%s.png"%(str(cache_key),name))
+            if name == "overview_detail":
+                # R269: Details native geometry is 1318x170. Use a new cache
+                # namespace so the retired 1318x136 derivative can never win.
+                target=os.path.join(cache_root,"dyn269overview_inset_%s_%s.png"%(str(cache_key),name))
+            elif name == "overview":
+                target=os.path.join(cache_root,"dyn165overview_inset_%s_%s.png"%(str(cache_key),name))
+            else:
+                target=os.path.join(cache_root,("dyn146series_cinematic_%s_%s.png" if name in ("series_row","series_row_selected") else "dyn125details_%s_%s.png")%(str(cache_key),name))
             if _valid_cache_file(target):
                 result[name]=target;continue
             temp=target+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
             w,h=size
             out=_PILImage.new("RGBA",size,(0,0,0,0))
             glow=_PILImage.new("RGBA",size,(0,0,0,0));gd=ImageDraw.Draw(glow)
-            gd.rounded_rectangle((6,6,w-7,h-7),radius=radius,outline=accent+(92 if is_panel else 78,),width=3)
-            if _PILImageFilter is not None:glow=glow.filter(_PILImageFilter.GaussianBlur(radius=7 if is_panel else 5))
+            
+            if name == "series_row_selected":
+                # Strong remote-focus halo: same adaptive hue, visibly thicker so
+                # focus stays obvious even on bright backdrops.
+                gd.rounded_rectangle((5,5,w-6,h-6),radius=radius,outline=accent+(235,),width=5)
+                blur_radius=6
+            elif name == "series_row":
+                gd.rounded_rectangle((6,6,w-7,h-7),radius=radius,outline=accent+(96,),width=3)
+                blur_radius=5
+            else:
+                gd.rounded_rectangle((6,6,w-7,h-7),radius=radius,outline=accent+(92 if is_panel else 78,),width=3)
+                blur_radius=7 if is_panel else 5
+            if _PILImageFilter is not None:glow=glow.filter(_PILImageFilter.GaussianBlur(radius=blur_radius))
             out=_PILImage.alpha_composite(out,glow)
             draw=ImageDraw.Draw(out)
             # us217: adaptive glass. Keep the backdrop visible through the
@@ -165,43 +210,57 @@ def _build_dynamic_details_chrome(source_path, cache_key):
                 fill_alpha=82; border_alpha=188; border_width=1
             elif name in ("cast_card", "director_card", "writer_card", "cast_card_ep", "director_card_ep", "writer_card_ep"):
                 fill_alpha=88; border_alpha=184; border_width=1
-            elif name in ("quality", "year", "runtime", "country", "genre", "genre_detail", "poster_footer", "poster_footer_detail"):
+            elif name in ("quality", "year", "runtime", "country", "genre", "genre_detail", "cast_detail", "poster_footer", "poster_footer_detail"):
                 fill_alpha=98; border_alpha=196; border_width=1
             else:
                 fill_alpha=112; border_alpha=(190 if is_panel else 202); border_width=1
             if name == "series_row":
-                # us218: one clean floating glass layer only. No doubled inner
-                # picture/rim beneath the season/episode row.
-                fill=_mix_rgb((4,12,18),accent,0.10)
-                fill_alpha=108
-                border_alpha=130
+                # Match the approved Cinematic catalogue glass exactly: very
+                # transparent body, adaptive hue mainly in the rim, backdrop visible.
+                fill=_mix_rgb((3,10,15),accent,0.040)
+                fill_alpha=68
+                border_alpha=104
                 border_width=1
             elif name == "series_row_selected":
-                # Selection is a single adaptive glass card with one crisp edge.
-                # Avoid the old blurred halo which looked like a second image/card.
-                fill=_mix_rgb((4,13,18),accent,0.18)
-                fill_alpha=126
-                border_alpha=232
-                border_width=2
-            if name == "poster_overlay":
-                draw.rounded_rectangle((2,2,w-3,h-3),radius=radius,outline=accent+(238,),width=3)
+                # Same Cinematic selected material: transparent body with a
+                # strong adaptive laser rim/glow, never a dark opaque slab.
+                fill=_mix_rgb((3,10,15),accent,0.055)
+                fill_alpha=82
+                border_alpha=255
+                border_width=3
+            # R165 same-version visual polish: overview keeps its full-resolution
+            # adaptive rim, but the dark reading slab now sits one step inside it.
+            # Nothing is runtime-scaled, so the Full-HD edge/corner quality is
+            # preserved while a clean breathing gap remains above/below the fill.
+            is_overview = name in ("overview", "overview_detail")
+            if is_overview:
+                draw.rounded_rectangle((2,2,w-3,h-3),radius=radius,fill=None,outline=accent+(border_alpha,),width=border_width)
+                inset_x,inset_y=10,9
+                draw.rounded_rectangle((inset_x,inset_y,w-inset_x-1,h-inset_y-1),radius=max(7,radius-7),fill=fill+(fill_alpha,))
             else:
                 draw.rounded_rectangle((2,2,w-3,h-3),radius=radius,fill=fill+(fill_alpha,),outline=accent+(border_alpha,),width=border_width)
             inner=_mix_rgb(accent,(255,255,255),0.40)
-            # Detail glass gets one delicate inner rim and a visible polished
-            # reflection. Series rows intentionally remain single-layer cards.
-            if name not in ("poster_overlay","series_row","series_row_selected"):
+            # Detail glass gets one delicate inner rim. Series rows keep a
+            # subtler full-height inner edge so the lower corners never look cut.
+            if name in ("series_row","series_row_selected"):
+                draw.rounded_rectangle((5,5,w-6,h-6),radius=max(5,radius-3),outline=(255,255,255,(150 if name=="series_row_selected" else 26)),width=1)
+            elif is_overview:
+                draw.rounded_rectangle((11,10,w-12,h-11),radius=max(6,radius-8),outline=inner+(22,),width=1)
+            else:
                 draw.rounded_rectangle((7,7,w-8,h-8),radius=max(5,radius-6),outline=inner+(22,),width=1)
-            if name != "poster_overlay":
-                sheen=_PILImage.new("RGBA",size,(0,0,0,0));sd=ImageDraw.Draw(sheen)
-                sheen_alpha = 17 if name in ("panel","panel_detail") else (15 if is_panel else 13)
+            sheen=_PILImage.new("RGBA",size,(0,0,0,0));sd=ImageDraw.Draw(sheen)
+            sheen_alpha = 17 if name in ("panel","panel_detail") else (15 if is_panel else 13)
+            if is_overview:
+                sd.rounded_rectangle((15,12,w-16,max(20,h//2)),radius=max(5,radius-10),fill=inner+(sheen_alpha,))
+            else:
                 sd.rounded_rectangle((12,7,w-13,max(14,h//2)),radius=max(5,radius-8),fill=inner+(sheen_alpha,))
-                if _PILImageFilter is not None:sheen=sheen.filter(_PILImageFilter.GaussianBlur(radius=4 if is_panel else 3))
-                out=_PILImage.alpha_composite(out,sheen)
+            if _PILImageFilter is not None:sheen=sheen.filter(_PILImageFilter.GaussianBlur(radius=4 if is_panel else 3))
+            out=_PILImage.alpha_composite(out,sheen)
             draw=ImageDraw.Draw(out)
             _persistent_write_require(temp);out.save(temp,"PNG")
             _persistent_write_require(target);os.replace(temp,target);result[name]=target
-        ring_target=os.path.join(THUMB_CACHE_DIR,"dyn220laser_%s_rating_ring.png"%str(cache_key))
+        result["accent_color"]="#%02x%02x%02x"%(int(accent[0]),int(accent[1]),int(accent[2]))
+        ring_target=os.path.join(cache_root,"dyn220laser_%s_rating_ring.png"%str(cache_key))
         if not _valid_cache_file(ring_target):
             temp=ring_target+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
             ring=_PILImage.new("RGBA",(108,108),(0,0,0,0));d=ImageDraw.Draw(ring)
@@ -328,118 +387,290 @@ def _build_home_adaptive_focus(source_path, cache_key):
     except Exception as exc:optional_failure("ui.home_adaptive_focus",exc);return {}
 
 
-def _build_category_adaptive_chrome(source_path, cache_key, media_type=""):
-    # Category chrome is session UI, not durable media. Keep it in /tmp so the
-    # adaptive background never depends on HDD mount/spin-up state. This also
-    # prevents the fast RAM-prefetched category screen from outrunning the
-    # persistent-cache initializer and silently losing its adaptive layer.
+def _cached_dynamic_settings_episode_rows(source_path, cache_key, selected_rim_only=False, cinematic_premium=False):
+    """Return already-built Settings/Series row assets without opening artwork.
+
+    This helper is intentionally GUI-safe: it only computes deterministic cache
+    paths and validates the two tiny PNGs.  Palette extraction/Pillow work remains
+    in the background builder below.
+    """
+    if not source_path or not os.path.isfile(source_path) or not THUMB_CACHE_DIR or _valid_cache_file is None:
+        return {}
+    result = {}
+    try:
+        for selected in (False, True):
+            name = "selected" if selected else "normal"
+            target = os.path.join(
+                THUMB_CACHE_DIR,
+                "dyn_settings_episode_%s_%s%s%s.png" % (
+                    str(cache_key), name,
+                    "_rim" if (selected and selected_rim_only) else "",
+                    "_premium" if cinematic_premium else "",
+                ),
+            )
+            if _valid_cache_file(target):
+                result[name] = target
+        return result if result.get("normal") and result.get("selected") else {}
+    except Exception:
+        return {}
+
+def _build_dynamic_settings_episode_rows(source_path, cache_key, selected_rim_only=False, cinematic_premium=False):
+    """Build only the two 426x72 adaptive glass rows used by Settings.
+
+    Geometry/material deliberately mirrors the approved Series episode floating
+    rows, but avoids generating the full Details chrome bundle when Settings is
+    opened from Home.  This keeps first-open work tiny on receiver hardware.
+    """
+    if not _persistent_write_ok(THUMB_CACHE_DIR):
+        return {}
+    if _PILImage is None or ImageDraw is None or not source_path or not os.path.isfile(source_path):
+        return {}
+    try:
+        primary, secondary = _dynamic_palette(source_path)
+        accent = _lift_dynamic_accent(primary, 0.48, 0.46)
+        accent2 = _lift_dynamic_accent(secondary, 0.42, 0.38)
+        result = {}
+        for selected in (False, True):
+            name = "selected" if selected else "normal"
+            target = os.path.join(THUMB_CACHE_DIR, "dyn_settings_episode_%s_%s%s%s.png" % (str(cache_key), name, "_rim" if (selected and selected_rim_only) else "", "_premium" if cinematic_premium else ""))
+            if _valid_cache_file(target):
+                result[name] = target
+                continue
+            temp = target + ".tmp.%d.%d" % (os.getpid(), threading.get_ident())
+            w, h, radius = 426, 72, 22
+            out = _PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+
+            # Settings keeps the historical restrained material. Cinematic can
+            # ask for a richer glass pass without changing row geometry or the
+            # shared Settings/Episodes renderer. Adaptive colour remains on the
+            # rim/glow for selection, never as a coloured selected slab.
+            glow = _PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(glow)
+            # Cinematic: normal rows only whisper the current adaptive hue;
+            # the focused row alone gets the bright, unmistakable neon rim.
+            glow_alpha = (250 if selected else 54) if cinematic_premium else 78
+            glow_width = 5 if (cinematic_premium and selected) else (2 if cinematic_premium else 3)
+            gd.rounded_rectangle((6, 6, w - 7, h - 7), radius=radius, outline=accent + (glow_alpha,), width=glow_width)
+            if _PILImageFilter is not None:
+                glow = glow.filter(_PILImageFilter.GaussianBlur(radius=6 if cinematic_premium else 5))
+            out = _PILImage.alpha_composite(out, glow)
+
+            draw = ImageDraw.Draw(out)
+            if selected:
+                if selected_rim_only:
+                    fill = _mix_rgb((3, 10, 15), accent, 0.055 if cinematic_premium else 0.10)
+                    fill_alpha = 82 if cinematic_premium else 108
+                    border_alpha = 255 if cinematic_premium else 238
+                    border_width = 3 if cinematic_premium else 2
+                else:
+                    fill = _mix_rgb((4, 13, 18), accent, 0.18)
+                    fill_alpha, border_alpha, border_width = 126, 232, 2
+            else:
+                fill = _mix_rgb((3, 10, 15), accent, 0.040 if cinematic_premium else 0.10)
+                fill_alpha = 68 if cinematic_premium else 108
+                border_alpha = 104 if cinematic_premium else 130
+                border_width = 1
+            draw.rounded_rectangle(
+                (2, 2, w - 3, h - 3), radius=radius,
+                fill=fill + (fill_alpha,), outline=accent + (border_alpha,), width=border_width
+            )
+            if cinematic_premium:
+                # Fine inner white edge keeps the full card reading as one clean
+                # glass sheet.  Do not add a lower dark strip: on the receiver it
+                # looked like the glass had been clipped away at the bottom.
+                draw.rounded_rectangle((5, 5, w - 6, h - 6), radius=radius-3, outline=(255,255,255,150 if selected else 26), width=1)
+
+            inner = _mix_rgb(accent2, (255, 255, 255), 0.46 if cinematic_premium else 0.40)
+            sheen = _PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(sheen)
+            sd.rounded_rectangle((12, 7, w - 13, max(14, h // 2)), radius=max(5, radius - 8), fill=inner + ((42 if selected else 10) if cinematic_premium else 13,))
+            if _PILImageFilter is not None:
+                sheen = sheen.filter(_PILImageFilter.GaussianBlur(radius=3))
+            out = _PILImage.alpha_composite(out, sheen)
+
+            _persistent_write_require(temp)
+            out.save(temp, "PNG")
+            _persistent_write_require(target)
+            os.replace(temp, target)
+            if _valid_cache_file(target):
+                result[name] = target
+        result["value_color"] = accent
+        return result
+    except Exception as exc:
+        optional_failure("ui.settings_episode_rows", exc)
+        return {}
+
+@image_budgeted
+def _build_category_extended_backdrop(source_path, cache_key):
+    """Build a receiver-safe Categories hero that reaches lower than Home.
+
+    Home intentionally fades its prepared hero out around the menu zone.  That is
+    perfect for Home, but leaves Categories with a large black right half.  Build
+    a dedicated 1920x1080 derivative from the *raw cached Home backdrop* and keep
+    it fully visible longer before a soft fade into the page background.
+
+    Disk-only and cache-keyed: no provider/network work is ever triggered here.
+    """
+    try:
+        os.makedirs(CATEGORY_ADAPTIVE_TMP_DIR, mode=0o700, exist_ok=True)
+    except Exception as exc:
+        optional_failure("ui.category_backdrop_dir", exc)
+        return None
+    if _PILImage is None or not source_path or not os.path.isfile(source_path):
+        return None
+    target = os.path.join(CATEGORY_ADAPTIVE_TMP_DIR, "cat_hero_long_%s.png" % str(cache_key))
+    if _valid_cache_file(target):
+        return target
+    temp = target + ".tmp.%d.%d" % (os.getpid(), threading.get_ident())
+    try:
+        tw, th = 1920, 1080
+        res = getattr(getattr(_PILImage, "Resampling", _PILImage), "LANCZOS", 1)
+        with _PILImage.open(source_path) as image:
+            image = image.convert("RGB")
+            if image.width < 16 or image.height < 16:
+                return None
+            # True cover crop.  This turns any raw TMDB/local backdrop into the
+            # same receiver-sized canvas before Enigma2 ever sees it.
+            scale = max(float(tw) / max(1, image.width), float(th) / max(1, image.height))
+            nw = max(tw, int(round(image.width * scale)))
+            nh = max(th, int(round(image.height * scale)))
+            image = image.resize((nw, nh), res)
+            left = max(0, (nw - tw) // 2)
+            top = max(0, (nh - th) // 2)
+            image = image.crop((left, top, left + tw, top + th))
+
+            # Keep the movie art crisp but slightly restrained behind glass rows.
+            grade = _PILImage.new("RGBA", (tw, th), (2, 7, 12, 30))
+            rgba = _PILImage.alpha_composite(image.convert("RGBA"), grade)
+
+            # Test15: Home fades at ~610px.  Categories hold the picture much
+            # lower, then dissolve gently so the bottom remains clean rather than
+            # becoming a hard full-screen wallpaper.
+            fade_start = 500.0
+            fade_end = 880.0
+            alpha_vals = []
+            for y in range(th):
+                if y <= fade_start:
+                    a = 255
+                elif y >= fade_end:
+                    a = 0
+                else:
+                    t = (y - fade_start) / (fade_end - fade_start)
+                    smooth = t * t * (3.0 - 2.0 * t)
+                    a = int(255 * (1.0 - smooth))
+                alpha_vals.append(max(0, min(255, a)))
+            alpha = _PILImage.new("L", (1, th))
+            alpha.putdata(alpha_vals)
+            alpha = alpha.resize((tw, th))
+            if _PILImageFilter is not None:
+                try:
+                    alpha = alpha.filter(_PILImageFilter.GaussianBlur(radius=10))
+                except Exception as exc:
+                    optional_failure("ui.category_backdrop_alpha", exc)
+            rgba.putalpha(alpha)
+            _persistent_write_require(temp)
+            rgba.save(temp, "PNG", optimize=False)
+        _persistent_write_require(target)
+        os.replace(temp, target)
+        return target if _valid_cache_file(target) else None
+    except Exception as exc:
+        optional_failure("ui.category_extended_backdrop", exc)
+        try:
+            if os.path.exists(temp) and _persistent_write_ok(temp):
+                os.unlink(temp)
+        except Exception as cleanup_exc:
+            optional_failure("ui.category_extended_backdrop_cleanup", cleanup_exc)
+        return None
+
+def _build_category_adaptive_chrome(source_path, cache_key, media_type="", row_width=674, accent_override=None, accent2_override=None):
+    """Build Settings-style adaptive glass rows for Categories.
+
+    Categories use the exact Home hero as the visible backdrop.  This helper only
+    builds the two floating row materials.  ``row_width`` is calculated once from
+    the longest category title in the *entire* category list, so paging never makes
+    the rail breathe wider/narrower between groups of 14.
+    """
     try:
         os.makedirs(CATEGORY_ADAPTIVE_TMP_DIR, mode=0o700, exist_ok=True)
     except Exception as exc:
         optional_failure("ui.category_adaptive_tmp", exc)
         return {}
-    """Build Select-Portal-grade floating glass rows for Categories.
-
-    The Home hero only supplies the adaptive palette.  The rows themselves stay
-    dark/glassy so they remain calm and readable, with the same floating visual
-    language as Select Portal rather than an opaque black list slab.
-    """
     if _PILImage is None or ImageDraw is None or not source_path or not os.path.isfile(source_path):
         return {}
     try:
+        row_width=max(426,min(860,int(row_width or 674)))
         primary, secondary = _dynamic_palette(source_path)
-        accent = _lift_dynamic_accent(primary, 0.70, 0.78)
-        accent2 = _lift_dynamic_accent(secondary, 0.58, 0.68)
-        base = (4, 12, 18)
-        specs = {
-            "row": (674, 62, 18, False),
-            "row_selected": (674, 62, 18, True),
-            "info": (508, 74, 20, False),
-        }
+        # Match the approved Settings episode-row material, compressed only in
+        # height so fourteen rows fit cleanly. Keep the Settings 22px corner
+        # language instead of the shallower Test12 category radius.
+        # Player overlays may supply the Player's already-authoritative adaptive
+        # accent. Geometry/material remain byte-for-byte this builder; only the
+        # colour authority changes, so Player menus never borrow Home/Settings.
+        accent = _lift_dynamic_accent(primary, 0.48, 0.46)
+        accent2 = _lift_dynamic_accent(secondary, 0.42, 0.38)
+        def _rgb_override(value, fallback):
+            try:
+                if isinstance(value,(tuple,list)) and len(value)>=3:
+                    return tuple(max(0,min(255,int(value[i]))) for i in range(3))
+                text=str(value or "").strip().lstrip("#")
+                if len(text)==8: text=text[-6:]
+                if len(text)==6:
+                    return (int(text[0:2],16),int(text[2:4],16),int(text[4:6],16))
+            except Exception:
+                pass
+            return fallback
+        if accent_override is not None:
+            accent=_rgb_override(accent_override,accent)
+        if accent2_override is not None:
+            accent2=_rgb_override(accent2_override,accent2)
         out_paths = {}
-        for name, (w, h, r, selected) in specs.items():
-            target = os.path.join(CATEGORY_ADAPTIVE_TMP_DIR, "cat224_%s_%s.png" % (str(cache_key), name))
+        for selected in (False, True):
+            name = "row_selected" if selected else "row"
+            target = os.path.join(
+                CATEGORY_ADAPTIVE_TMP_DIR,
+                "cat_settings_contrast_v3_%s_%s_%d.png" % (str(cache_key), name, row_width)
+            )
             if _valid_cache_file(target):
                 out_paths[name] = target
                 continue
             tmp = target + ".tmp.%d.%d" % (os.getpid(), threading.get_ident())
-            img = _PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+            w,h,r = row_width,62,22
+            img = _PILImage.new("RGBA", (w,h), (0,0,0,0))
 
-            # Soft energy stays inside the rounded silhouette, like Select Portal.
-            glow = _PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+            # Test16: retain the Settings glass language, but give Categories
+            # a little more body over bright hero regions.  The selected row gets
+            # a stronger adaptive halo/rim so remote focus is immediately obvious.
+            glow = _PILImage.new("RGBA", (w,h), (0,0,0,0))
             gd = ImageDraw.Draw(glow)
-            glow_alpha = 148 if selected else 46
-            gd.rounded_rectangle((5, 5, w-6, h-6), radius=r,
-                                 outline=accent + (glow_alpha,), width=(3 if selected else 2))
+            glow_alpha = 160 if selected else 92
+            glow_width = 4 if selected else 3
+            gd.rounded_rectangle((5,5,w-6,h-6), radius=r,
+                                 outline=accent+(glow_alpha,), width=glow_width)
             if _PILImageFilter is not None:
-                glow = glow.filter(_PILImageFilter.GaussianBlur(radius=7 if selected else 4))
+                glow = glow.filter(_PILImageFilter.GaussianBlur(radius=6 if selected else 5))
             img = _PILImage.alpha_composite(img, glow)
 
             d = ImageDraw.Draw(img)
-            # Deliberately translucent: this is glass, not a black rectangle.
-            fill_mix = 0.115 if selected else 0.064
-            fill = _mix_rgb(base, accent, fill_mix)
-            fill_alpha = 162 if selected else 142
-            edge_alpha = 235 if selected else 108
-            d.rounded_rectangle((2, 2, w-3, h-3), radius=r,
-                                fill=fill + (fill_alpha,),
-                                outline=accent + (edge_alpha,),
-                                width=(2 if selected else 1))
+            if selected:
+                fill = _mix_rgb((3,11,17), accent, 0.24)
+                fill_alpha,border_alpha,border_width = 160,255,2
+            else:
+                fill = _mix_rgb((3,10,16), accent, 0.08)
+                fill_alpha,border_alpha,border_width = 140,154,1
+            d.rounded_rectangle((2,2,w-3,h-3), radius=r,
+                                fill=fill+(fill_alpha,), outline=accent+(border_alpha,),
+                                width=border_width)
 
-            # Polished inner rim and a faint upper glass reflection.
-            inner = _mix_rgb(accent2, (255,255,255), 0.34)
-            d.rounded_rectangle((7, 7, w-8, h-8), radius=max(9, r-6),
-                                outline=inner + ((82 if selected else 38),), width=1)
-            sheen = _PILImage.new("RGBA", (w, h), (0,0,0,0))
-            sd = ImageDraw.Draw(sheen)
-            hi = _mix_rgb(accent, (255,255,255), 0.54)
-            top = max(24, int(h*0.46))
-            for yy in range(9, top, 5):
-                t = (yy-9.0)/max(1.0, top-9.0)
-                a = max(0, int((34 if selected else 20) * (1.0-t)**1.65))
-                sd.rounded_rectangle((13, yy, w-14, min(h-12, yy+7)),
-                                     radius=max(7, r-9), fill=hi + (a,))
+            inner = _mix_rgb(accent2,(255,255,255),0.40)
+            sheen = _PILImage.new("RGBA",(w,h),(0,0,0,0)); sd=ImageDraw.Draw(sheen)
+            sd.rounded_rectangle((12,7,w-13,max(14,h//2)), radius=max(5,r-8),
+                                 fill=inner+((27 if selected else 14),))
             if _PILImageFilter is not None:
-                sheen = sheen.filter(_PILImageFilter.GaussianBlur(radius=4))
-            img = _PILImage.alpha_composite(img, sheen)
-
-            img.save(tmp, "PNG", optimize=False)
-            os.replace(tmp, target)
-            out_paths[name] = target
-        # Use the exact adaptive atmosphere language that originally worked on
-        # Series.  Movies and Live now run this identical code path with the
-        # exact Home hero source passed in-memory by PortalHomeScreen.
-        page_key = hashlib.sha1((str(source_path)+"|"+str(cache_key)+"|series-proven-v2-lowmem").encode("utf-8","ignore")).hexdigest()[:20]
-        page_target = os.path.join(CATEGORY_ADAPTIVE_TMP_DIR,"catpage_%s_960x540.png"%page_key)
-        if _valid_cache_file(page_target,ttl=0):
-            out_paths["page"] = page_target
-        else:
-            page_tmp = page_target+".tmp.%d.%d"%(os.getpid(),threading.get_ident())
-            try:
-                primary,secondary=_dynamic_palette(source_path)
-                pw,ph=120,68; base=(2,7,12)
-                page_small=_PILImage.new("RGB",(pw,ph),base); pp=page_small.load()
-                pr,pg,pb=primary; sr,sg,sb=secondary
-                # Same radial field as the working poster-grid/Series mood, but
-                # moderated so it remains cinematic rather than eye-searing.
-                for yy in range(ph):
-                    ny=yy/float(max(1,ph-1))
-                    for xx in range(pw):
-                        nx=xx/float(max(1,pw-1)); dx=(nx-0.50)/0.62; dy=(ny-0.53)/0.58
-                        radial=max(0.0,1.0-(dx*dx+dy*dy)); edge=max(0.0,1.0-abs(nx-0.5)*2.0)
-                        a=0.43*radial*(0.98-0.24*ny); bmix=0.14*edge*(1.0-0.30*ny)
-                        rr=int(base[0]*(1-a-bmix)+pr*a+sr*bmix); gg=int(base[1]*(1-a-bmix)+pg*a+sg*bmix); bb=int(base[2]*(1-a-bmix)+pb*a+sb*bmix)
-                        pp[xx,yy]=(max(0,min(255,rr)),max(0,min(255,gg)),max(0,min(255,bb)))
-                resampling=getattr(getattr(_PILImage,"Resampling",_PILImage),"BICUBIC",3)
-                page_img=page_small.resize((960,540),resampling)
-                if _PILImageFilter is not None: page_img=page_img.filter(_PILImageFilter.GaussianBlur(12))
-                page_img.save(page_tmp,"PNG",optimize=False); os.replace(page_tmp,page_target)
-                out_paths["page"] = page_target
-            except Exception as exc:
-                optional_failure("ui.category_page_adaptive",exc)
-                try:
-                    if os.path.exists(page_tmp): os.unlink(page_tmp)
-                except Exception as exc: optional_failure("ui.silent_guard",exc)
+                sheen=sheen.filter(_PILImageFilter.GaussianBlur(radius=3))
+            img=_PILImage.alpha_composite(img,sheen)
+            img.save(tmp,"PNG",optimize=False); os.replace(tmp,target)
+            out_paths[name]=target
+        out_paths["value_color"] = accent
         return out_paths
     except Exception as exc:
         optional_failure("ui.category_adaptive_chrome", exc)
@@ -533,10 +764,8 @@ def _build_live_adaptive_chrome_211(source_path, cache_key=None):
             "info":(940,244,26,False,112),
             "tech":(205,46,18,False,96),
             "row":(748,58,18,False,54),
-            # HUD cards intentionally match the Mini List glass vocabulary.
+            # The compact Live HUD now keeps only the page/channel counter.
             "counter":(575,54,18,False,152),
-            "channel_top":(500,52,17,False,164),
-            "clock":(260,82,20,False,156),
         }
         for name,(w,h,r,selected,alpha) in specs.items():
             target=os.path.join(THUMB_CACHE_DIR,"live211_%s_%s.png"%(key,name))
@@ -549,10 +778,10 @@ def _build_live_adaptive_chrome_211(source_path, cache_key=None):
                 outer=_mix_rgb(accent,(255,255,255),0.18)
                 d.rounded_rectangle((2,2,w-3,h-3),radius=r,outline=outer+(105,),width=2)
                 d.rounded_rectangle((8,8,w-9,h-9),radius=max(12,r-7),outline=accent2+(38,),width=1)
-            elif name in ("counter","channel_top","clock"):
+            elif name=="counter":
                 # Same 3D floating glass recipe as the Mini List header/footer:
                 # contained depth, adaptive body, bright rim, inner rim, top sheen.
-                fill=_mix_rgb((4,12,18),accent,0.14 if name!="channel_top" else 0.18)
+                fill=_mix_rgb((4,12,18),accent,0.14)
                 depth=_PILImage.new("RGBA",(w,h),(0,0,0,0));dd=ImageDraw.Draw(depth)
                 dd.rounded_rectangle((5,7,w-6,h-3),radius=r,fill=(0,0,0,96))
                 if _PILImageFilter is not None:depth=depth.filter(_PILImageFilter.GaussianBlur(radius=5))
