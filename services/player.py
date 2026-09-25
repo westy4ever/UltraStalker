@@ -7,6 +7,6 @@ playback lifecycle accidentally.
 """
 from __future__ import absolute_import
 
-from .player_golden57 import UltraStalkerPlayer, force_session_silence, shutdown_player_workers
+from .player_native import UltraStalkerPlayer, force_session_silence, shutdown_player_workers
 
 __all__ = ("UltraStalkerPlayer", "force_session_silence", "shutdown_player_workers")

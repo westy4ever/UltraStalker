@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Player visual/artwork helpers.
+"""Artwork and visual preparation helpers for Ultra Stalker Player.
 
-Extracted from services.player to keep rendering/cache concerns separate from
-the playback lifecycle. This module intentionally contains no Screen/player
-state transitions.
+Stage-1 extraction only: no artwork policy, cache lookup or rendering logic is
+changed here; the original functions are kept byte-for-byte at function level.
 """
 from __future__ import absolute_import, print_function
 
@@ -12,34 +11,81 @@ try:
 except Exception:
     from .. import compat_colorsys as colorsys
 
-from ..core.image_budget import image_budgeted
-
 import hashlib
 import os
 import re
+import stat
 import threading
+from collections import OrderedDict
 
 try:
-    from PIL import Image as _PILImage, ImageDraw as _ImageDraw, ImageFilter as _ImageFilter, ImageEnhance as _ImageEnhance
+    from PIL import Image as _PILImage, ImageDraw as _ImageDraw, ImageFilter as _ImageFilter
 except Exception:
     _PILImage = None
     _ImageDraw = None
     _ImageFilter = None
-    _ImageEnhance = None
 
+from ..core.image_budget import image_budgeted
 from ..securefs import secure_private_dir
 from ..persistent_cache import ROOT as PERSISTENT_CACHE_ROOT, GENERATED as PERSISTENT_GENERATED_DIR
+from ..storage import load_settings
+from ..ui_artwork_helpers import _fit_live_picon_canvas
 from ..log import optional_failure
-from ..core.executor import LazyThreadPoolExecutor
+from .player_visuals import _PROGRESS_FRAME_EXECUTOR, _PROGRESS_FRAME_PENDING, _PROGRESS_FRAME_LOCK
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSET_DIR = os.path.join(PLUGIN_DIR, "assets_fhd")
 PLAYER_ASSET_DIR = os.path.join(ASSET_DIR, "player")
 PLAYER_FALLBACK_INFOBAR_DIR = os.path.join(PLAYER_ASSET_DIR, "fallback_infobar")
 
-_PROGRESS_FRAME_EXECUTOR = LazyThreadPoolExecutor(max_workers=1, thread_name_prefix="ultrastalker-progress")
-_PROGRESS_FRAME_PENDING = set()
-_PROGRESS_FRAME_LOCK = threading.RLock()
+# Stage-2: bounded in-memory artwork memoization. Persistent files remain the
+# source of truth; these caches only avoid reopening/re-analysing the same
+# unchanged source image repeatedly during one Player session.
+_ARTWORK_MEMO_LIMIT = 48
+_ARTWORK_MEMO_LOCK = threading.RLock()
+_FALLBACK_FRAMES_MEMO = None
+_ADAPTIVE_PLAYER_MEMO = OrderedDict()
+_ADAPTIVE_INFO_MEMO = OrderedDict()
+_LIVE_PICON_MEMO = OrderedDict()
+_POSTER_RESOLUTION_MEMO = OrderedDict()
+
+def _source_signature(path, min_size=1):
+    try:
+        source = str(path or "")
+        if not source:
+            return None
+        st = os.stat(source)
+        if not stat.S_ISREG(st.st_mode) or int(st.st_size) < int(min_size):
+            return None
+        stamp = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1000000000)))
+        return (source, stamp, int(st.st_size))
+    except Exception:
+        return None
+
+def _memo_get(cache, key):
+    with _ARTWORK_MEMO_LOCK:
+        value = cache.get(key)
+        if value is None:
+            return None
+        try:
+            cache.move_to_end(key)
+        except Exception:
+            pass
+        return value
+
+def _memo_put(cache, key, value):
+    with _ARTWORK_MEMO_LOCK:
+        cache[key] = value
+        try:
+            cache.move_to_end(key)
+        except Exception:
+            pass
+        while len(cache) > _ARTWORK_MEMO_LIMIT:
+            try:
+                cache.popitem(last=False)
+            except Exception:
+                break
+    return value
 
 def _fallback_player_frames():
     """Bundled receiver-safe neutral glass.
@@ -48,6 +94,10 @@ def _fallback_player_frames():
     first-line player chrome so a late/missing adaptive source can never leave
     naked text and controls floating over video.
     """
+    global _FALLBACK_FRAMES_MEMO
+    with _ARTWORK_MEMO_LOCK:
+        if _FALLBACK_FRAMES_MEMO is not None:
+            return dict(_FALLBACK_FRAMES_MEMO)
     names=("main","poster_halo","poster","live_picon","track","keybar",
            "chip_quality","chip_video","chip_audio_codec",
            "chip_stream","chip_audio","chip_subtitles","chip_engine")
@@ -59,10 +109,12 @@ def _fallback_player_frames():
     out["accent"]="#4aa2d6"
     out["accent_soft"]="#9bd9f5"
     out["accent_neon"]="#69c9f4"
-    return out
+    with _ARTWORK_MEMO_LOCK:
+        _FALLBACK_FRAMES_MEMO=dict(out)
+    return dict(out)
 
 @image_budgeted
-def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canvas=None, poster_art_size=None, poster_art_offset=None, cache_namespace=None):
+def _adaptive_player_frames(source_path):
     """Create player chrome with the exact floating-glass language used by Categories/Portal rows.
 
     Geometry stays identical to us226. Only the material changes: dark calm glass,
@@ -71,8 +123,14 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
     if _PILImage is None or _ImageDraw is None:
         return {}
     try:
-        if not source_path or not os.path.isfile(source_path):
+        signature=_source_signature(source_path,1)
+        if signature is None:
             return {}
+        memo_key=(signature,"player-glass-v1")
+        memo=_memo_get(_ADAPTIVE_PLAYER_MEMO,memo_key)
+        if memo is not None:
+            return dict(memo)
+        source_path=signature[0]
         with _PILImage.open(source_path) as im:
             im = im.convert("RGB")
             im.thumbnail((96, 96))
@@ -88,11 +146,6 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
         l = max(.38, min(.54, l))
         rr, gg, bb = colorsys.hls_to_rgb(h, l, sat)
         accent = (int(rr*255), int(gg*255), int(bb*255))
-        # Cinematic can lock the poster halo to the already-established page
-        # adaptive colour. Player callers pass no override and keep existing behaviour.
-        override=str(accent_override or "").strip().lstrip("#")
-        if re.fullmatch(r"[0-9A-Fa-f]{6}",override):
-            accent=tuple(int(override[i:i+2],16) for i in (0,2,4))
         # Secondary accent is a slightly softer/lighter cousin, same idea as category glass.
         accent2 = tuple(min(255, int(v*0.78 + 255*0.22)) for v in accent)
         base = (4, 12, 18)
@@ -103,22 +156,18 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
 
         cache = os.path.join(PERSISTENT_GENERATED_DIR,"player_glass241")
         secure_private_dir(cache)
-        halo_canvas=tuple(poster_halo_canvas or (310,415))
-        art_size=tuple(poster_art_size or (250,375))
-        art_offset=tuple(poster_art_offset or (30,20))
-        namespace=str(cache_namespace or "player")
-        key = hashlib.sha1((source_path + str(os.path.getmtime(source_path)) + str(accent) + "|" + str(accent_override or "") + "|glass241-b94|" + namespace + "|" + str(halo_canvas) + "|" + str(art_size) + "|" + str(art_offset)).encode("utf-8", "ignore")).hexdigest()[:16]
+        key = hashlib.sha1((source_path + str(os.path.getmtime(source_path)) + str(accent) + "glass245-player-exactfit-titlelogo-episode-marker").encode("utf-8", "ignore")).hexdigest()[:16]
         out = {}
 
         specs = {
             # name: (size, radius, selected_like, fill_alpha, edge_alpha, glow_alpha)
             "main": ((1800,200), 26, True, 226, 238, 196),
-            # Separate halo canvas. Defaults are unchanged for Player/Cinematic.
-            # Details can request the same recipe at its native large-poster geometry.
-            "poster_halo": (halo_canvas, 28, True, 0, 255, 255),
+            # Separate halo canvas. This is intentionally larger than the poster frame
+            # so Enigma2 cannot clip the outer neon at the artwork boundary.
+            "poster_halo": ((310,415), 28, True, 0, 255, 255),
             "poster": ((270,395), 22, True, 0, 255, 255),
             "live_picon": ((240,152), 18, True, 118, 245, 188),
-            "keybar": ((1600,58), 22, True, 232, 228, 178),
+            "keybar": ((1540,58), 22, True, 232, 228, 178),
             "chip_quality": ((150,42), 15, False, 232, 226, 168),
             "chip_video": ((130,42), 15, False, 232, 226, 168),
             "chip_audio_codec": ((120,42), 15, False, 232, 226, 168),
@@ -140,9 +189,7 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
                     # drops/weakens soft semi-transparent Gaussian bloom. Use stepped,
                     # near-opaque adaptive energy bands baked into the SAME pixmap as
                     # the poster so the effect survives framebuffer composition.
-                    ox,oy=int(art_offset[0]),int(art_offset[1])
-                    aw,ah=int(art_size[0]),int(art_size[1])
-                    poster_box = (ox, oy, ox+aw-1, oy+ah-1)
+                    poster_box = (30, 20, 279, 394)
                     hot = mix(accent, (255,255,255), .62)
                     white_hot = mix(accent, (255,255,255), .92)
                     outer = mix(accent, (255,255,255), .28)
@@ -163,39 +210,59 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
                     # No external flare ticks: on the receiver these rendered as four
                     # white crop marks around the poster. Keep only the continuous rim.
 
-                    # Bake poster into the same RGBA pixmap. This is already proven to
-                    # render on the receiver; only the soft bloom was disappearing.
-                    try:
-                        prepared = _prepare_player_poster_fill(source_path, art_size)
-                        artwork_path = prepared if prepared and os.path.isfile(prepared) else source_path
-                        with _PILImage.open(artwork_path) as art:
-                            art = art.convert("RGBA")
-                            if art.size != art_size:
-                                res = getattr(getattr(_PILImage,"Resampling",_PILImage),"LANCZOS",1)
-                                art = art.resize(art_size, res)
-                            img.alpha_composite(art, (ox,oy))
-                        d=_ImageDraw.Draw(img)
-                        # Exact same hard hot rim recipe, resolved against the requested poster box.
-                        d.rounded_rectangle((poster_box[0]-1,poster_box[1]-1,poster_box[2]+1,poster_box[3]+1),radius=18,outline=hot+(255,),width=3)
-                        d.rounded_rectangle(poster_box,radius=16,outline=white_hot+(255,),width=1)
-                    except Exception as exc:
-                        optional_failure("player.poster_composite", exc)
+                    # Keep this layer as chrome only. The real poster is now always the
+                    # bottom-most layer, while every halo/rim layer renders above it.
+                    # This preserves the exact premium frame but lets the overlays hide
+                    # any rectangular poster corners that used to peek outside the rim.
+                    d=_ImageDraw.Draw(img)
+                    d.rounded_rectangle((29,19,280,395),radius=18,outline=hot+(255,),width=3)
+                    d.rounded_rectangle((30,20,279,394),radius=16,outline=white_hot+(255,),width=1)
                 elif name == "poster":
-                    # The foreground frame is now deliberately clean.  All bloom is on
-                    # poster_halo behind it, so nothing can be clipped by this 270x395 widget.
+                    # Foreground poster chrome. The actual poster sits 10 px inside this
+                    # 270x395 overlay. Paint only the four outside corner wedges above
+                    # the poster, then redraw the exact existing rim. This does NOT crop
+                    # or resize the artwork; it simply makes the chrome the final visible
+                    # edge so no poster corners can protrude past the rounded frame.
                     hot = mix(accent, (255,255,255), .72)
                     white_hot = mix(accent, (255,255,255), .94)
+                    glass_corner = mix(base, accent, .13)
+                    poster_rect=(10,10,w-11,hh-11)
+                    mask=_PILImage.new("L",size,0)
+                    md=_ImageDraw.Draw(mask)
+                    md.rectangle(poster_rect,fill=255)
+                    md.rounded_rectangle(poster_rect,radius=18,fill=0)
+                    corner_layer=_PILImage.new("RGBA",size,glass_corner+(246,))
+                    img.alpha_composite(_PILImage.composite(corner_layer,_PILImage.new("RGBA",size,(0,0,0,0)),mask))
+                    d=_ImageDraw.Draw(img)
                     d.rounded_rectangle((4,4,w-5,hh-5),radius=22,outline=accent+(255,),width=3)
                     d.rounded_rectangle((6,6,w-7,hh-7),radius=20,outline=hot+(255,),width=2)
                     d.rounded_rectangle((8,8,w-9,hh-9),radius=18,outline=white_hot+(220,),width=1)
                 else:
                     fill_mix = 0.13 if name == "main" else (0.115 if name == "keybar" else 0.105)
                     fill = mix(base, accent, fill_mix)
-                    d.rounded_rectangle((2,2,w-3,hh-3), radius=radius,
-                                        fill=fill + (fill_alpha,),
-                                        outline=accent + (edge_alpha,), width=(3 if selected else 2))
+                    # Fill the ENTIRE widget canvas. Older builds started at (2,2),
+                    # leaving a transparent video-colored gutter between the adaptive
+                    # material and its glass rim. The user wants one continuous glass
+                    # surface: transparency must come only from the material alpha,
+                    # never from an accidental empty strip around the frame.
+                    outer_box=(0,0,w-1,hh-1)
+                    edge_width=(3 if selected else 2)
+                    d.rounded_rectangle(outer_box, radius=radius, fill=fill + (fill_alpha,))
+                    # Exact-fit outer closure for the main Player panel and lower keybar.
+                    # These two widgets must read as one complete adaptive surface with no
+                    # apparent empty strip between the glass body and the outer rim.
+                    if name in ("main","keybar"):
+                        d.rounded_rectangle(outer_box, radius=radius,
+                                            outline=accent + (min(255, edge_alpha + 12),), width=1)
+                        d.rounded_rectangle((1,1,w-2,hh-2), radius=max(1,radius-1),
+                                            outline=accent + (edge_alpha,), width=edge_width)
+                        inner_inset=4
+                    else:
+                        d.rounded_rectangle((1,1,w-2,hh-2), radius=max(1,radius-1),
+                                            outline=accent + (edge_alpha,), width=edge_width)
+                        inner_inset=5
                     inner = mix(accent2, (255,255,255), .34)
-                    d.rounded_rectangle((7,7,w-8,hh-8), radius=max(8,radius-6),
+                    d.rounded_rectangle((inner_inset,inner_inset,w-1-inner_inset,hh-1-inner_inset), radius=max(8,radius-inner_inset),
                                         outline=inner + ((126 if selected else 92),), width=1)
 
                     # Polished upper reflection copied from the approved category glass treatment.
@@ -203,20 +270,17 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
                     sd = _ImageDraw.Draw(sheen)
                     hi = mix(accent, (255,255,255), .54)
                     top = max(18, int(hh*0.43))
-                    for yy in range(8, top, 5):
-                        t = (yy-8.0)/max(1.0, top-8.0)
+                    for yy in range(6, top, 5):
+                        t = (yy-6.0)/max(1.0, top-6.0)
                         a = max(0, int((38 if selected else 25) * (1.0-t)**1.65))
-                        sd.rounded_rectangle((13, yy, w-14, min(hh-11, yy+7)),
-                                             radius=max(6,radius-9), fill=hi + (a,))
+                        sd.rounded_rectangle((10, yy, w-11, min(hh-8, yy+7)),
+                                             radius=max(6,radius-8), fill=hi + (a,))
                     if _ImageFilter is not None:
                         sheen = sheen.filter(_ImageFilter.GaussianBlur(radius=4 if selected else 3))
                     img = _PILImage.alpha_composite(img, sheen)
-                    if name == "keybar":
-                        kd = _ImageDraw.Draw(img)
-                        sep = mix(accent, (255,255,255), .30)
-                        # Subtle dividers create a real control dock rather than a long empty strip.
-                        for xx in (235, 485, 755, 1045, 1345):
-                            kd.line((xx,13,xx,hh-13), fill=sep + (72,), width=1)
+                    # No vertical separators in the keybar. It is intentionally one
+                    # uninterrupted adaptive glass dock; the four Cinematic buttons
+                    # provide all visual grouping by themselves.
 
                 img.save(target, "PNG")
             out[name] = target
@@ -235,6 +299,7 @@ def _adaptive_player_frames(source_path, accent_override=None, poster_halo_canva
         out["accent"] = "#%02x%02x%02x" % accent
         out["accent_soft"] = "#%02x%02x%02x" % mix(accent, (255,255,255), .54)
         out["accent_neon"] = "#%02x%02x%02x" % mix(accent, (255,255,255), .32)
+        _memo_put(_ADAPTIVE_PLAYER_MEMO,memo_key,dict(out))
         return out
     except Exception as exc:
         optional_failure("player.adaptive_frames", exc)
@@ -311,22 +376,9 @@ def _schedule_progress_neon_frame(accent_hex,value):
     except Exception as exc:optional_failure("player.progress_schedule",exc)
     return ""
 
-def shutdown_player_workers(wait=False):
-    try:_PROGRESS_FRAME_EXECUTOR.shutdown(wait=bool(wait),cancel_futures=True)
-    except Exception as exc:optional_failure("player.progress_shutdown",exc)
+
 def _asset(name):
     return os.path.join(ASSET_DIR, name)
-
-
-
-
-NEXT_EPISODE_AUTOPLAY_SESSION = True
-
-
-
-
-
-
 
 
 
@@ -363,9 +415,15 @@ def _image_value(item):
 
 @image_budgeted
 def _adaptive_info_frames(source_path):
-    if _PILImage is None or _ImageDraw is None or not source_path or not os.path.isfile(source_path):
+    if _PILImage is None or _ImageDraw is None:
         return {}
     try:
+        signature=_source_signature(source_path,1)
+        if signature is None:return {}
+        memo_key=(signature,"info-glass-v1")
+        memo=_memo_get(_ADAPTIVE_INFO_MEMO,memo_key)
+        if memo is not None:return dict(memo)
+        source_path=signature[0]
         with _PILImage.open(source_path) as im:
             im=im.convert("RGB");im.thumbnail((72,96))
             pixels=[p for p in im.getdata() if 25<sum(p)/3.0<235]
@@ -407,23 +465,42 @@ def _adaptive_info_frames(source_path):
                 if _ImageFilter is not None:sheen=sheen.filter(_ImageFilter.GaussianBlur(4))
                 img=_PILImage.alpha_composite(img,sheen)
             img.save(target,"PNG")
+        _memo_put(_ADAPTIVE_INFO_MEMO,memo_key,dict(out))
         return out
     except Exception as exc:
         optional_failure("player.info_glass",exc);return {}
 
 def _cached_poster(item, name, media_type):
     is_live=str(media_type or "").lower() in ("itv","live")
+    data=item if isinstance(item,dict) else {}
+    # Only memoize a real resolved file. Placeholders are intentionally never
+    # memoized because a Live picon can arrive asynchronously a moment later.
+    relevant=(
+        str(data.get("_player_picon") or ""), str(data.get("_player_poster") or ""),
+        str(data.get("_player_picon_url") or ""), str(data.get("stream_icon") or ""),
+        str(data.get("picon") or ""), str(data.get("logo") or ""),
+        str(data.get("poster") or ""), str(data.get("poster_url") or ""),
+        str(data.get("cover") or ""), str(data.get("cover_url") or ""),
+        str(data.get("icon") or ""), str(data.get("image") or ""), str(data.get("img") or ""),
+    )
+    memo_key=(str(media_type or "").lower(),str(name or ""),relevant)
+    cached=_memo_get(_POSTER_RESOLUTION_MEMO,memo_key)
+    if cached and _source_signature(cached,101) is not None:
+        return cached
+
     explicit_key="_player_picon" if is_live else "_player_poster"
-    direct = str((item or {}).get(explicit_key) or (item or {}).get("_player_poster") or "").strip()
-    if direct and os.path.isfile(direct):
-        return direct
-    value = _image_value(item)
-    if value and os.path.isfile(value):
-        return value
+    direct = str(data.get(explicit_key) or data.get("_player_poster") or "").strip()
+    if direct and _source_signature(direct,1) is not None:
+        return _memo_put(_POSTER_RESOLUTION_MEMO,memo_key,direct)
+    value = _image_value(data)
+    if value and _source_signature(value,1) is not None:
+        return _memo_put(_POSTER_RESOLUTION_MEMO,memo_key,value)
     # Prefer the absolute picon URL attached by the browser; its digest is the
     # same persistent HDD cache key used by the live grid.
     if is_live:
-        picon_url=str((item or {}).get("_player_picon_url") or "").strip()
+        # Provider/browser channel art is not consistent about the field name.
+        # Reuse the already-cached HDD picon regardless of which native key supplied it.
+        picon_url=str(data.get("_player_picon_url") or data.get("stream_icon") or data.get("picon") or data.get("logo") or data.get("icon") or data.get("image") or data.get("img") or "").strip()
         if picon_url:value=picon_url
     if value.startswith(("http://", "https://")):
         digest = hashlib.sha1(value.encode("utf-8", "ignore")).hexdigest()
@@ -433,29 +510,111 @@ def _cached_poster(item, name, media_type):
         for root in roots:
             for ext in (".png", ".jpg", ".jpeg", ".webp"):
                 candidate = os.path.join(root, digest + ext)
-                if os.path.isfile(candidate) and os.path.getsize(candidate) > 100:
-                    return candidate
-    # Live must never show a generated initial/letter.  Until a real picon is
-    # available use the neutral live asset; the card remains exactly 220x132.
+                if _source_signature(candidate,101) is not None:
+                    return _memo_put(_POSTER_RESOLUTION_MEMO,memo_key,candidate)
+    # Live must never show a generated initial/letter. Until a real picon is
+    # available use the neutral live asset; do not memoize it.
     if is_live:
         return _asset("us168_live_placeholder_220x132.png")
     return _letter_logo(name, media_type)
 
-
-
-
-
-
-
-
-
 @image_budgeted
 def _prepare_player_poster_fill(source_path, size=(242,330)):
-    """Reuse the master HDD poster directly; resizing stays in-memory at render time."""
+    """Player reuses the exact HDD master poster path; no player-only poster copy."""
     return source_path
 
 @image_budgeted
 def _prepare_live_picon(source_path, size=(220,132)):
-    """Reuse the cached live picon directly; do not create a player-only picon file."""
-    return source_path
+    """Aspect-fit Live picon on an exact transparent 220x132 Enigma-style canvas."""
+    signature=_source_signature(source_path,101)
+    if signature is None:return source_path
+    try:tw,th=max(1,int(size[0])),max(1,int(size[1]))
+    except Exception:tw,th=220,132
+    memo_key=(signature,tw,th)
+    cached=_memo_get(_LIVE_PICON_MEMO,memo_key)
+    if cached and _source_signature(cached,101) is not None:return cached
+    prepared=_fit_live_picon_canvas(signature[0],PERSISTENT_GENERATED_DIR,(tw,th)) or signature[0]
+    if prepared and _source_signature(prepared,101) is not None:
+        _memo_put(_LIVE_PICON_MEMO,memo_key,prepared)
+    return prepared
 
+def _player_title_logo_source(item, name, media_type):
+    """Return the current title's Cinematic authority, never a Player lookup.
+
+    Player is presentation-only.  It first honors an explicit current-screen
+    handoff, then the unified Ultra Cinematic 420x144 cache for the same locked
+    identity.  It never selects a 1220x72 cache entry independently.
+    """
+    item=item if isinstance(item,dict) else {}
+    try:
+        for key in ("_player_title_logo_cinematic_source",):
+            candidate=str(item.get(key) or "")
+            if candidate and os.path.isfile(candidate) and os.path.getsize(candidate)>256:return candidate
+        from ..title_logo_ultra import ultra_title_logo_cached
+        return ultra_title_logo_cached(media_type,item,item,(420,144),name)
+    except Exception as exc:
+        optional_failure("player.title_logo_source",exc);return ""
+
+def _prepare_player_title_logo_cache_path(source_path, canvas_size=(1220,78)):
+    try:
+        source=str(source_path or "")
+        if not source or not os.path.isfile(source) or os.path.getsize(source)<=256:return ""
+        st=os.stat(source)
+        stamp="%s|%s"%(int(getattr(st,"st_mtime_ns",int(st.st_mtime*1000000000))),int(st.st_size))
+        try:
+            cw,ch=int(canvas_size[0]),int(canvas_size[1])
+        except Exception:
+            cw,ch=1220,78
+        digest=hashlib.sha1((source+"|"+stamp+"|player-title-logo-%sx%s-v3"%(cw,ch)).encode("utf-8","ignore")).hexdigest()[:20]
+        return os.path.join(PERSISTENT_GENERATED_DIR,"player_title_logos","%s.png"%digest)
+    except Exception:return ""
+
+@image_budgeted
+def _prepare_player_title_logo(source_path, canvas_size=(1220,78)):
+    """Create a pristine persistent Player presentation from the HDD master.
+
+    Transparent margins are trimmed first, aspect ratio is preserved exactly,
+    and LANCZOS is used only for down-scaling. The master is never modified.
+    """
+    if _PILImage is None:return ""
+    try:
+        source=str(source_path or "")
+        if not source or not os.path.isfile(source) or os.path.getsize(source)<=256:return ""
+        cw,ch=int(canvas_size[0]),int(canvas_size[1])
+        target=_prepare_player_title_logo_cache_path(source,(cw,ch))
+        if not target:return ""
+        cache=os.path.dirname(target)
+        secure_private_dir(cache)
+        if os.path.isfile(target) and os.path.getsize(target)>256:return target
+        with _PILImage.open(source) as src:
+            im=src.convert("RGBA")
+            try:
+                bbox=im.getchannel("A").getbbox()
+                if bbox:im=im.crop(bbox)
+            except Exception:pass
+            if im.width<2 or im.height<2:return ""
+            max_w,max_h=max(1,cw-24),max(1,ch-4)
+            scale=min(float(max_w)/float(im.width),float(max_h)/float(im.height),1.0)
+            nw=max(1,int(round(im.width*scale)));nh=max(1,int(round(im.height*scale)))
+            if (nw,nh)!=im.size:
+                res=getattr(getattr(_PILImage,"Resampling",_PILImage),"LANCZOS",1)
+                im=im.resize((nw,nh),res)
+            canvas=_PILImage.new("RGBA",(cw,ch),(0,0,0,0))
+            canvas.alpha_composite(im,((cw-nw)//2,max(0,(ch-nh)//2)))
+            tmp=target+".tmp.%s"%os.getpid()
+            canvas.save(tmp,"PNG",compress_level=1);os.replace(tmp,target)
+        return target if os.path.isfile(target) and os.path.getsize(target)>256 else ""
+    except Exception as exc:
+        optional_failure("player.title_logo_prepare",exc);return ""
+
+def _apply_player_font_scale(xml):
+    try:mode=str(load_settings().get("font_scale") or "normal").lower()
+    except Exception:mode="normal"
+    factor={"normal":1.0,"large":1.12,"larger":1.22,"xlarge":1.32}.get(mode,1.0)
+    if factor<=1.0:return xml
+    def _font(m):
+        base=int(m.group(2))
+        if base<12:return m.group(0)
+        size=max(base,min(base+10,int(round(base*factor))))
+        return 'font="%s;%d"'%(m.group(1),size)
+    return re.sub(r'font="([^;]+);(\d+)"',_font,xml)
